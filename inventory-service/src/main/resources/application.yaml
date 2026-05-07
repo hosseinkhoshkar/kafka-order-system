@@ -18,3 +18,4 @@ spring:
 kafka:
   topic:
     orders: orders
+    inventory-reply: inventory-reply
