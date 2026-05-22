@@ -1,8 +1,9 @@
 package com.example.inventoryservice.consumer;
 
-import com.example.inventoryservice.model.OrderStatus;
 import com.example.inventoryservice.model.Order;
+import com.example.inventoryservice.model.OrderStatus;
 import com.example.inventoryservice.model.InventoryReply;
+import com.example.inventoryservice.service.EventStoreService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
@@ -17,6 +18,7 @@ import org.springframework.stereotype.Service;
 public class InventoryConsumer {
 
     private final KafkaTemplate<String, Object> kafkaTemplate;
+    private final EventStoreService eventStoreService;
 
     @Value("${kafka.topic.inventory-reply}")
     private String inventoryReplyTopic;
@@ -35,6 +37,15 @@ public class InventoryConsumer {
 
         InventoryReply reply = processInventory(order);
 
+        // ذخیره event داخل event store
+        eventStoreService.saveEvent(
+                order.getOrderId(),
+                "INVENTORY",
+                reply.getStatus().name(),
+                reply
+        );
+
+        // ارسال reply به order-service
         kafkaTemplate.send(inventoryReplyTopic, order.getOrderId(), reply);
         log.info("📤 Reply sent | orderId: {} | status: {}",
                 order.getOrderId(), reply.getStatus());
