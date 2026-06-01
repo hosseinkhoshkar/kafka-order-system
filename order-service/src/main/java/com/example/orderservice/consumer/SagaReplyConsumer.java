@@ -1,48 +1,53 @@
 package com.example.orderservice.consumer;
 
+import com.example.orderservice.entity.OrderEntity;
 import com.example.orderservice.model.InventoryReply;
 import com.example.orderservice.model.OrderStatus;
+import com.example.orderservice.repository.OrderRepository;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Service;
 
+import java.time.LocalDateTime;
+import java.util.Optional;
+
 @Slf4j
 @Service
+@RequiredArgsConstructor
 public class SagaReplyConsumer {
+
+    private final OrderRepository orderRepository;
 
     @KafkaListener(topics = "${kafka.topic.inventory-reply}", groupId = "order-group")
     public void consumeInventoryReply(ConsumerRecord<String, InventoryReply> record) {
         InventoryReply reply = record.value();
 
-        log.info("📨 Inventory reply received | orderId: {} | status: {} | partition: {} | offset: {}",
-                reply.getOrderId(),
-                reply.getStatus(),
-                record.partition(),
-                record.offset()
-        );
+        log.info("📨 Inventory reply received | orderId: {} | status: {}",
+                reply.getOrderId(), reply.getStatus());
+
+        Optional<OrderEntity> orderOpt = orderRepository.findById(reply.getOrderId());
+
+        if (orderOpt.isEmpty()) {
+            log.error("❌ Order not found in DB | orderId: {}", reply.getOrderId());
+            return;
+        }
+
+        OrderEntity order = orderOpt.get();
 
         if (reply.getStatus() == OrderStatus.INVENTORY_RESERVED) {
-            handleOrderConfirmed(reply);
+            order.setStatus(OrderStatus.CONFIRMED);
+            log.info("✅ Order CONFIRMED | orderId: {}", reply.getOrderId());
         } else if (reply.getStatus() == OrderStatus.INVENTORY_FAILED) {
-            handleOrderCancelled(reply);
+            order.setStatus(OrderStatus.CANCELLED);
+            log.warn("❌ Order CANCELLED | orderId: {} | reason: {}",
+                    reply.getOrderId(), reply.getMessage());
         }
-    }
 
-    private void handleOrderConfirmed(InventoryReply reply) {
-        log.info("✅ Order CONFIRMED | orderId: {} | message: {}",
-                reply.getOrderId(),
-                reply.getMessage()
-        );
-        // TODO: آپدیت status سفارش به CONFIRMED داخل DB
-    }
-
-    private void handleOrderCancelled(InventoryReply reply) {
-        log.warn("❌ Order CANCELLED | orderId: {} | reason: {}",
-                reply.getOrderId(),
-                reply.getMessage()
-        );
-        // TODO: آپدیت status سفارش به CANCELLED داخل DB
-        // TODO: Compensating Transaction — مثلاً برگشت پول
+        order.setUpdatedAt(LocalDateTime.now());
+        orderRepository.save(order);
+        log.info("💾 Order status updated in DB | orderId: {} | status: {}",
+                order.getOrderId(), order.getStatus());
     }
 }
