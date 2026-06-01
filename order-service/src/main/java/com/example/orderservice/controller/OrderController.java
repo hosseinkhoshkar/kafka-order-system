@@ -6,6 +6,7 @@ import com.example.orderservice.model.Order;
 import com.example.orderservice.model.OrderStatus;
 import com.example.orderservice.producer.OrderProducer;
 import com.example.orderservice.repository.OrderRepository;
+import com.example.orderservice.service.EventStoreService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
@@ -22,12 +23,12 @@ public class OrderController {
 
     private final OrderProducer orderProducer;
     private final OrderRepository orderRepository;
+    private final EventStoreService eventStoreService;
 
     @PostMapping
     public ResponseEntity<Order> createOrder(@RequestBody OrderRequest request) {
         String orderId = UUID.randomUUID().toString();
 
-        // ۱. ذخیره داخل DB
         OrderEntity orderEntity = OrderEntity.builder()
                 .orderId(orderId)
                 .productId(request.getProductId())
@@ -41,7 +42,8 @@ public class OrderController {
         orderRepository.save(orderEntity);
         log.info("💾 Order saved to DB | orderId: {}", orderId);
 
-        // ۲. ارسال به Kafka
+        eventStoreService.saveEvent(orderId, "ORDER", "ORDER_CREATED", orderEntity);
+
         Order order = Order.builder()
                 .orderId(orderId)
                 .productId(request.getProductId())
