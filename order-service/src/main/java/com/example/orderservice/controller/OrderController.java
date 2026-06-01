@@ -7,9 +7,11 @@ import com.example.orderservice.model.OrderStatus;
 import com.example.orderservice.producer.OrderProducer;
 import com.example.orderservice.repository.OrderRepository;
 import com.example.orderservice.service.EventStoreService;
+import com.example.orderservice.service.OutboxEventService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 
 import java.time.LocalDateTime;
@@ -21,14 +23,16 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class OrderController {
 
-    private final OrderProducer orderProducer;
     private final OrderRepository orderRepository;
     private final EventStoreService eventStoreService;
+    private final OutboxEventService outboxEventService;
 
     @PostMapping
+    @Transactional
     public ResponseEntity<Order> createOrder(@RequestBody OrderRequest request) {
         String orderId = UUID.randomUUID().toString();
 
+        // ۱. ذخیره order داخل DB
         OrderEntity orderEntity = OrderEntity.builder()
                 .orderId(orderId)
                 .productId(request.getProductId())
@@ -42,7 +46,11 @@ public class OrderController {
         orderRepository.save(orderEntity);
         log.info("💾 Order saved to DB | orderId: {}", orderId);
 
+        // ۲. ذخیره event داخل event store
         eventStoreService.saveEvent(orderId, "ORDER", "ORDER_CREATED", orderEntity);
+
+        // ۳. ذخیره داخل outbox — به جای مستقیم Kafka فرستادن
+        outboxEventService.saveOutboxEvent(orderId, "ORDER", "ORDER_CREATED", orderEntity);
 
         Order order = Order.builder()
                 .orderId(orderId)
@@ -53,9 +61,8 @@ public class OrderController {
                 .status(OrderStatus.PENDING.name())
                 .createdAt(LocalDateTime.now())
                 .build();
-        orderProducer.sendOrder(order);
-        log.info("📦 New order created: {}", orderId);
 
+        log.info("📦 New order created: {}", orderId);
         return ResponseEntity.ok(order);
     }
 
