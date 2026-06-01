@@ -35,3 +35,31 @@ services:
     environment:
       KAFKA_CLUSTERS_0_NAME: local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+
+  postgres-order:
+    image: postgres:15
+    container_name: postgres-order
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: orderdb
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password
+    volumes:
+      - postgres_order_data:/var/lib/postgresql/data
+
+  postgres-inventory:
+    image: postgres:15
+    container_name: postgres-inventory
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: inventorydb
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password
+    volumes:
+      - postgres_inventory_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_order_data:
+  postgres_inventory_data:
