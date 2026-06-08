@@ -1,6 +1,6 @@
 package com.example.orderservice.config;
 
-import com.example.orderservice.model.InventoryReply;
+import com.example.common.event.EventEnvelope;
 import com.example.orderservice.model.Order;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.producer.ProducerConfig;
@@ -43,8 +43,8 @@ public class KafkaConfig {
 
     // ===== CONSUMER =====
     @Bean
-    public ConsumerFactory<String, InventoryReply> consumerFactory() {
-        JsonDeserializer<InventoryReply> deserializer = new JsonDeserializer<>(InventoryReply.class);
+    public ConsumerFactory<String, EventEnvelope> consumerFactory() {
+        JsonDeserializer<EventEnvelope> deserializer = new JsonDeserializer<>(EventEnvelope.class);
         deserializer.addTrustedPackages("*");
         deserializer.setRemoveTypeHeaders(false);
         deserializer.setUseTypeMapperForKey(true);
@@ -60,8 +60,8 @@ public class KafkaConfig {
     }
 
     @Bean
-    public ConcurrentKafkaListenerContainerFactory<String, InventoryReply> kafkaListenerContainerFactory() {
-        ConcurrentKafkaListenerContainerFactory<String, InventoryReply> factory =
+    public ConcurrentKafkaListenerContainerFactory<String, EventEnvelope> kafkaListenerContainerFactory() {
+        ConcurrentKafkaListenerContainerFactory<String, EventEnvelope> factory =
                 new ConcurrentKafkaListenerContainerFactory<>();
         factory.setConsumerFactory(consumerFactory());
         return factory;

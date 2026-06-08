@@ -1,6 +1,6 @@
 package com.example.inventoryservice.config;
 
-import com.example.inventoryservice.model.Order;
+import com.example.common.event.EventEnvelope;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.springframework.beans.factory.annotation.Value;
@@ -27,8 +27,8 @@ public class KafkaConsumerConfig {
     private String bootstrapServers;
 
     @Bean
-    public ConsumerFactory<String, Order> consumerFactory() {
-        JsonDeserializer<Order> deserializer = new JsonDeserializer<>(Order.class);
+    public ConsumerFactory<String, EventEnvelope> consumerFactory() {
+        JsonDeserializer<EventEnvelope> deserializer = new JsonDeserializer<>(EventEnvelope.class);
         deserializer.setRemoveTypeHeaders(false);
         deserializer.addTrustedPackages("*");
         deserializer.setUseTypeMapperForKey(true);
@@ -64,9 +64,9 @@ public class KafkaConsumerConfig {
     }
 
     @Bean
-    public ConcurrentKafkaListenerContainerFactory<String, Order> kafkaListenerContainerFactory(
+    public ConcurrentKafkaListenerContainerFactory<String, EventEnvelope> kafkaListenerContainerFactory(
             DefaultErrorHandler errorHandler) {
-        ConcurrentKafkaListenerContainerFactory<String, Order> factory =
+        ConcurrentKafkaListenerContainerFactory<String, EventEnvelope> factory =
                 new ConcurrentKafkaListenerContainerFactory<>();
         factory.setConsumerFactory(consumerFactory());
         factory.setCommonErrorHandler(errorHandler);
