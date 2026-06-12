@@ -18,8 +18,9 @@ POST /api/orders -> orderdb (order + history + outbox)
   -> order-service -> orderdb (CONFIRMED or CANCELLED + history)
 ```
 
-The HTTP response is `200` with `PENDING`. Completion is asynchronous. There is currently
-no GET-by-ID endpoint; inspect the database to see the final status.
+The HTTP response is `201 Created` with `PENDING` and a `Location: /api/orders/{orderId}`
+header. The order resource is persisted before responding; inventory confirmation remains
+asynchronous. Poll `GET /api/orders/{orderId}` for the final status.
 
 ## Prerequisites
 
@@ -65,9 +66,13 @@ The integration suite checks:
 - Quantity `11`: HTTP `PENDING` eventually becomes database `CANCELLED`.
 - Outbox reaches `SENT`; Order creation/final history and Inventory result are persisted.
 - The reply preserves the order correlation ID and product ID.
+- GET-by-ID returns the final status and preserves the exact decimal price in PostgreSQL.
+
+Order MVC tests also cover invalid inputs, malformed JSON, fractional quantities, 404,
+error response privacy, the Location header and exact decimal deserialization.
 
 These tests exercise the baseline happy path and business rejection, not crash recovery,
-duplicate delivery, invalid input or concurrent stock reservation.
+duplicate delivery or concurrent stock reservation. Invalid input is covered by MVC tests.
 
 Reports: each module's `target/surefire-reports`, plus
 `integration-tests/target/failsafe-reports`. Application logs:
@@ -125,7 +130,13 @@ Repeat with `quantity=11` to exercise rejection. Bash equivalent:
 curl -H 'Content-Type: application/json' -d '{"productId":"product-1","customerId":"customer-1","quantity":2,"price":12.50}' http://localhost:8081/api/orders
 ```
 
-Allow at least one relay cycle (five seconds) and inspect the final state:
+Poll the order in PowerShell (using the response from the POST example):
+
+```powershell
+Invoke-RestMethod -Uri "http://localhost:8081/api/orders/$($order.orderId)"
+```
+
+Allow at least one relay cycle (five seconds). You can also inspect database history:
 
 ```sh
 docker compose exec -T postgres-order psql -U admin -d orderdb -c "select order_id, quantity, status from orders order by created_at desc limit 10;"
@@ -139,8 +150,37 @@ Integration tests always start with fresh, separate databases; no local volume d
 
 ## Current limitations
 
-Input validation, GET-by-ID, real inventory, idempotency, reliable reply publication,
+Real inventory, idempotency, reliable reply publication,
 outbox retry/recovery and Saga timeouts remain future work. `event_store` is audit history,
 not a full event-sourced system. Hibernate currently manages schema with `ddl-auto:update`.
 The two existing application-class unit tests are not context-startup tests; actual startup
 is covered by the packaged-application integration suite.
+
+## Order API (stage 2)
+
+- `POST /api/orders`: `201 Created`, `Location` header and an order DTO.
+- `GET /api/orders/{orderId}`: `200` with the persisted status; `404` if absent.
+- `GET /api/orders/health`: unchanged basic liveness text.
+- Errors use `application/problem+json` with `type`, `title`, `status`, `detail` and `instance`.
+  Validation errors additionally contain an `errors` map keyed by field name.
+
+Both IDs must be nonblank and at most 255 characters. Quantity must be a positive integer
+within Java's Integer range; fractional quantities are rejected, not truncated.
+`price` is the positive **unit price in EUR**, with at most 17 integer digits and 2 fractional
+digits. This demo uses one implicit currency; the response includes `currency: "EUR"`.
+No currency conversion is performed, and total price is not calculated by this endpoint.
+Prices travel as JSON numbers and BigDecimal through request, entity, response and the
+existing OrderCreatedEvent. Clients should use decimal-aware JSON handling for money.
+
+Compatibility changes: POST previously returned 200 and now returns 201; invalid inputs
+previously accepted may now return 400. The response retains existing fields and adds
+currency and updatedAt. The Kafka envelope and event field structure remain unchanged.
+Confirm the EUR assumption for any pre-existing data; earlier versions did not define currency.
+
+### Existing database caveat
+
+The JPA price column is now `numeric(19,2)` instead of floating point. A fresh test database
+uses this mapping. Do not rely on `ddl-auto:update` to safely convert valuable existing data:
+back it up and inspect range, extra decimal places and prior floating-point rounding first.
+Versioned migrations and an audited conversion are stage 3; this patch does not run any SQL
+against your database. Existing values cannot regain precision already lost as doubles.

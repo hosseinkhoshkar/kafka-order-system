@@ -7,6 +7,7 @@ import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 import java.time.LocalDateTime;
+import java.math.BigDecimal;
 
 @Entity
 @Table(name = "orders")
@@ -21,7 +22,8 @@ public class OrderEntity {
     private String productId;
     private String customerId;
     private Integer quantity;
-    private Double price;
+    @Column(precision = 19, scale = 2)
+    private BigDecimal price;
 
     @Enumerated(EnumType.STRING)
     private OrderStatus status;

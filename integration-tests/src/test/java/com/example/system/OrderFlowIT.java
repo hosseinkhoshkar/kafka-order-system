@@ -20,6 +20,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.sql.DriverManager;
 import java.time.Duration;
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -35,7 +36,8 @@ import static org.awaitility.Awaitility.await;
 class OrderFlowIT {
     @Container
     static final ConfluentKafkaContainer KAFKA = new ConfluentKafkaContainer(
-            DockerImageName.parse("confluentinc/cp-kafka:7.4.0"));
+            DockerImageName.parse("confluentinc/cp-kafka:7.4.0"))
+            .withStartupTimeout(Duration.ofSeconds(120));
     @Container
     static final PostgreSQLContainer<?> ORDER_DB = new PostgreSQLContainer<>("postgres:15.6")
             .withDatabaseName("orderdb");
@@ -113,20 +115,34 @@ class OrderFlowIT {
                                                    String inventoryEvent, String orderEvent) throws Exception {
         String product = "product-" + UUID.randomUUID();
         String body = JSON.writeValueAsString(Map.of("productId", product,
-                "customerId", "customer-test", "quantity", quantity, "price", 12.5));
+                "customerId", "customer-test", "quantity", quantity, "price", new BigDecimal("123456789012345.67")));
         HttpResponse<String> response = HTTP.send(HttpRequest.newBuilder(
                         URI.create("http://localhost:" + orderPort + "/api/orders"))
                 .timeout(Duration.ofSeconds(15)).header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(body)).build(), HttpResponse.BodyHandlers.ofString());
-        assertThat(response.statusCode()).as(response.body()).isEqualTo(200);
+        assertThat(response.statusCode()).as(response.body()).isEqualTo(201);
         JsonNode order = JSON.readTree(response.body());
         assertThat(order.path("status").asText()).isEqualTo("PENDING");
         assertThat(order.path("quantity").asInt()).isEqualTo(quantity);
         String orderId = order.path("orderId").asText();
         assertThat(orderId).isNotBlank();
+        String location = response.headers().firstValue("Location").orElseThrow();
+        assertThat(location).isEqualTo("/api/orders/" + orderId);
 
         await().alias("Order " + orderId + " reaches " + status + "; see " + LOGS)
                 .atMost(Duration.ofSeconds(60)).pollInterval(Duration.ofMillis(250)).untilAsserted(() -> {
+                    HttpResponse<String> fetched = HTTP.send(HttpRequest.newBuilder(
+                            URI.create("http://localhost:" + orderPort + location))
+                            .timeout(Duration.ofSeconds(5)).GET().build(), HttpResponse.BodyHandlers.ofString());
+                    assertThat(fetched.statusCode()).isEqualTo(200);
+                    JsonNode fetchedOrder = new ObjectMapper()
+                            .enable(com.fasterxml.jackson.databind.DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS)
+                            .readTree(fetched.body());
+                    assertThat(fetchedOrder.path("status").asText()).isEqualTo(status);
+                    assertThat(fetchedOrder.path("price").decimalValue())
+                            .isEqualByComparingTo("123456789012345.67");
+                    assertThat(new BigDecimal(scalar(ORDER_DB, "select price from orders where order_id = ?", orderId)))
+                            .isEqualByComparingTo("123456789012345.67");
                     assertThat(scalar(ORDER_DB, "select status from orders where order_id = ?", orderId))
                             .isEqualTo(status);
                     assertThat(scalar(ORDER_DB,
