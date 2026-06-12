@@ -1,0 +1,35 @@
+name: Build and integration tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+      - name: Verify Docker
+        run: docker info
+      - name: Build and test the complete reactor
+        run: bash order-service/mvnw -B -ntp -f pom.xml clean verify
+      - name: Upload test reports and application logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            **/target/surefire-reports/**
+            **/target/failsafe-reports/**
+            integration-tests/target/application-logs/**
+          retention-days: 7
