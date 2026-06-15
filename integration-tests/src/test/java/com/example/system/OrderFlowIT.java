@@ -82,7 +82,7 @@ class OrderFlowIT {
                 "--spring.datasource.username=" + database.getUsername(),
                 "--spring.datasource.password=" + database.getPassword(),
                 "--spring.kafka.bootstrap-servers=" + KAFKA.getBootstrapServers(),
-                "--spring.jpa.hibernate.ddl-auto=create-drop",
+                "--spring.jpa.hibernate.ddl-auto=validate",
                 "--spring.jpa.show-sql=false",
                 "--spring.main.banner-mode=off");
         APPLICATIONS.add(new ProcessBuilder(command).directory(ROOT.toFile())

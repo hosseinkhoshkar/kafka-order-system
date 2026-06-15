@@ -152,7 +152,7 @@ Integration tests always start with fresh, separate databases; no local volume d
 
 Real inventory, idempotency, reliable reply publication,
 outbox retry/recovery and Saga timeouts remain future work. `event_store` is audit history,
-not a full event-sourced system. Hibernate currently manages schema with `ddl-auto:update`.
+not a full event-sourced system. Flyway manages schema and Hibernate validates it.
 The two existing application-class unit tests are not context-startup tests; actual startup
 is covered by the packaged-application integration suite.
 
@@ -177,10 +177,77 @@ previously accepted may now return 400. The response retains existing fields and
 currency and updatedAt. The Kafka envelope and event field structure remain unchanged.
 Confirm the EUR assumption for any pre-existing data; earlier versions did not define currency.
 
-### Existing database caveat
+## Database schema and migrations
 
-The JPA price column is now `numeric(19,2)` instead of floating point. A fresh test database
-uses this mapping. Do not rely on `ddl-auto:update` to safely convert valuable existing data:
-back it up and inspect range, extra decimal places and prior floating-point rounding first.
-Versioned migrations and an audited conversion are stage 3; this patch does not run any SQL
-against your database. Existing values cannot regain precision already lost as doubles.
+Both services use Flyway migrations from their own module:
+
+- `order-service/src/main/resources/db/migration`
+- `inventory-service/src/main/resources/db/migration`
+
+Normal application startup runs pending migrations first, then Hibernate validates the
+schema with `spring.jpa.hibernate.ddl-auto=validate`. A brand-new empty database is created
+from `V1__initial_schema.sql`; follow-up compatibility checks live in later migrations.
+Do not edit an applied migration. Add a new versioned migration instead.
+
+The migration index choices are intentionally narrow:
+
+- `outbox_events(status)`: supports the current relay query for pending outbox rows.
+- `event_store(aggregate_id, version)`: supports aggregate history reads ordered by version.
+
+No unique constraint is placed on event version yet because the current version allocation is
+not concurrency-safe. `sent_at` remains nullable because pending and failed outbox rows have
+not necessarily been sent.
+
+### Empty local databases
+
+For a fresh local demo database, start Compose and then start both applications normally.
+Flyway will create the schema; Hibernate will validate it. If startup fails at validation,
+inspect the Flyway error before changing application code.
+
+### Existing database adoption
+
+`baseline-on-migrate` is deliberately not enabled in application configuration. To adopt an
+existing database that was previously managed by Hibernate `ddl-auto:update`, perform this
+manually and only after taking a backup.
+
+Minimum pre-checks for `orderdb`:
+
+```sql
+select count(*) from orders where
+  order_id is null or product_id is null or customer_id is null
+  or quantity is null or price is null or status is null
+  or created_at is null or updated_at is null;
+
+select count(*) from orders where quantity <= 0;
+select count(*) from orders where price <= 0;
+select count(*) from orders where price > 99999999999999999.99;
+select count(*) from orders where abs(price::numeric - round(price::numeric, 2)) > 0.0000001;
+select status, count(*) from orders group by status;
+```
+
+Minimum pre-checks for `inventorydb`:
+
+```sql
+select count(*) from inventory where
+  product_id is null or available_quantity is null or reserved_quantity is null;
+select count(*) from inventory where available_quantity < 0 or reserved_quantity < 0;
+```
+
+If the existing order `price` column is floating point, precision already lost by the old
+type cannot be recovered. The compatibility migration refuses null, non-positive,
+out-of-range and more-than-two-decimal-place prices rather than silently rounding business
+data. Resolve any returned rows explicitly before migration.
+
+Manual adoption outline:
+
+1. Stop both applications.
+2. Take a database-native backup, for example `pg_dump`, and verify it can be restored.
+3. Run the pre-check queries above and resolve any incompatible rows by an explicit
+   operational decision.
+4. Baseline each existing schema at version `1` using Flyway tooling or a one-off
+   maintenance command with the service's migration directory.
+5. Run Flyway migrate for that same service.
+6. Start the application and confirm Hibernate validation succeeds.
+
+Rollback is backup/restore. Do not treat conversion from `numeric(19,2)` back to floating
+point as a lossless rollback; it can lose decimal fidelity.
