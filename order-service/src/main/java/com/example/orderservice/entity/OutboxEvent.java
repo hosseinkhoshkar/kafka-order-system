@@ -1,10 +1,14 @@
 package com.example.orderservice.entity;
 
-import jakarta.persistence.*;
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
+
 import java.time.LocalDateTime;
 
 @Entity
@@ -18,15 +22,36 @@ public class OutboxEvent {
     @Id
     private String id;
 
-    private String aggregateId;    // orderId
-    private String aggregateType;  // ORDER
-    private String eventType;      // ORDER_CREATED
+    @Column(nullable = false)
+    private String aggregateId;
 
-    @Column(columnDefinition = "TEXT")
-    private String payload;        // JSON کامل
+    @Column(nullable = false)
+    private String aggregateType;
 
-    private String status;         // PENDING, SENT, FAILED
+    @Column(nullable = false)
+    private String eventType;
 
+    @Column(columnDefinition = "TEXT", nullable = false)
+    private String payload;
+
+    @Column(nullable = false)
+    private String status;
+
+    @Column(nullable = false)
     private LocalDateTime createdAt;
+
     private LocalDateTime sentAt;
+
+    @Column(nullable = false)
+    private Integer attemptCount;
+
+    @Column(nullable = false)
+    private LocalDateTime nextAttemptAt;
+
+    @Column(length = 1024)
+    private String lastError;
+
+    private String claimToken;
+    private String claimedBy;
+    private LocalDateTime claimedUntil;
 }

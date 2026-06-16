@@ -2,7 +2,6 @@ package com.example.orderservice.service;
 
 import com.example.orderservice.entity.OutboxEvent;
 import com.example.orderservice.repository.OutboxEventRepository;
-import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -22,6 +21,7 @@ public class OutboxEventService {
     public void saveOutboxEvent(String aggregateId, String aggregateType,
                                 String eventType, Object payload) {
         try {
+            LocalDateTime now = LocalDateTime.now();
             OutboxEvent outboxEvent = OutboxEvent.builder()
                     .id(UUID.randomUUID().toString())
                     .aggregateId(aggregateId)
@@ -29,16 +29,16 @@ public class OutboxEventService {
                     .eventType(eventType)
                     .payload(objectMapper.writeValueAsString(payload))
                     .status("PENDING")
-                    .createdAt(LocalDateTime.now())
+                    .createdAt(now)
+                    .attemptCount(0)
+                    .nextAttemptAt(now)
                     .build();
 
             outboxEventRepository.save(outboxEvent);
-            log.info("📬 Outbox event saved | aggregateId: {} | type: {}",
-                    aggregateId, eventType);
-
-        } catch (JsonProcessingException e) {
-            log.error("❌ Failed to save outbox event | aggregateId: {} | error: {}",
-                    aggregateId, e.getMessage());
+            log.info("Outbox event saved | aggregateId: {} | type: {}", aggregateId, eventType);
+        } catch (Exception e) {
+            log.error("Failed to save outbox event | aggregateId: {} | error: {}", aggregateId, e.getMessage());
+            throw new IllegalStateException("Failed to save outbox event for aggregate " + aggregateId, e);
         }
     }
 }
