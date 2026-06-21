@@ -8,4 +8,6 @@ import java.util.List;
 @Repository
 public interface EventStoreRepository extends JpaRepository<EventStore, String> {
     List<EventStore> findByAggregateIdOrderByVersionAsc(String aggregateId);
+
+    long countByAggregateId(String aggregateId);
 }

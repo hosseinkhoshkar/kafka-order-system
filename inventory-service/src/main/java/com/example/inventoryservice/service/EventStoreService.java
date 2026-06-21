@@ -23,11 +23,7 @@ public class EventStoreService {
     public void saveEvent(String aggregateId, String aggregateType,
                           String eventType, Object payload) {
         try {
-            // version رو حساب کن — چند تا event قبلی داشتیم + 1
-            List<EventStore> previousEvents = eventStoreRepository
-                    .findByAggregateIdOrderByVersionAsc(aggregateId);
-            int nextVersion = previousEvents.size() + 1;
-
+            int nextVersion = Math.toIntExact(eventStoreRepository.countByAggregateId(aggregateId) + 1);
             EventStore event = EventStore.builder()
                     .id(UUID.randomUUID().toString())
                     .aggregateId(aggregateId)
@@ -39,12 +35,12 @@ public class EventStoreService {
                     .build();
 
             eventStoreRepository.save(event);
-            log.info("📝 Event saved | aggregateId: {} | type: {} | version: {}",
+            log.info("Event saved | aggregateId: {} | type: {} | version: {}",
                     aggregateId, eventType, nextVersion);
-
         } catch (JsonProcessingException e) {
-            log.error("❌ Failed to save event | aggregateId: {} | error: {}",
+            log.error("Failed to serialize inventory event | aggregateId: {} | error: {}",
                     aggregateId, e.getMessage());
+            throw new IllegalStateException("Failed to save inventory event for aggregate " + aggregateId, e);
         }
     }
 

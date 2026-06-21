@@ -32,3 +32,13 @@ kafka:
   topic:
     orders: orders
     inventory-reply: inventory-reply
+
+inventory:
+  outbox:
+    relay:
+      poll-interval-ms: 5000
+      batch-size: 25
+      lease-duration: PT2M
+      initial-backoff: PT2S
+      max-backoff: PT1M
+      max-attempts: 5

@@ -1,20 +1,24 @@
 # Kafka Order System
 
 Java 17 / Spring Boot demo of an asynchronous order workflow with Kafka and PostgreSQL.
-Inventory is currently simulated: quantities above 10 are rejected; all other quantities
-are accepted. No real stock is reserved. This baseline does not claim production readiness.
+Inventory is reserved from persisted stock in `inventorydb`. Kafka delivery is treated as
+at-least-once: duplicate order events are ignored by inventory Inbox and per-order decision
+records, and inventory replies are published through a recoverable Inventory Outbox. This
+baseline does not claim production readiness or exactly-once delivery.
 
 ## Modules and flow
 
 - `common`: shared JSON event envelopes and payloads.
 - `order-service`: HTTP API, order database, event history, scheduled outbox relay and reply consumer.
-- `inventory-service`: order consumer, simulated inventory decision, event history and reply producer.
+- `inventory-service`: order consumer, persisted inventory reservation, Inbox, decision log,
+  event history and scheduled reply outbox relay.
 - `integration-tests`: test-only module; launches both packaged applications with isolated infrastructure.
 
 ```text
 POST /api/orders -> orderdb (order + history + outbox)
   -> scheduled relay -> orders topic -> inventory-service
-  -> inventorydb (history) -> inventory-reply topic
+  -> inventorydb (Inbox + decision + stock + history + reply outbox)
+  -> scheduled relay -> inventory-reply topic
   -> order-service -> orderdb (CONFIRMED or CANCELLED + history)
 ```
 
@@ -62,17 +66,20 @@ are packaged before the test module runs.
 The integration suite checks:
 
 - Both real Spring applications start and the Order health endpoint responds.
-- Quantity `2`: HTTP `PENDING` eventually becomes database `CONFIRMED`.
-- Quantity `11`: HTTP `PENDING` eventually becomes database `CANCELLED`.
+- Quantity `2` with enough seeded stock: HTTP `PENDING` eventually becomes database `CONFIRMED`.
+- Quantity `11` with stock `20`: confirms, proving the old `quantity > 10` rule is gone.
+- Quantity above available stock: HTTP `PENDING` eventually becomes database `CANCELLED`.
 - Outbox reaches `SENT`; Order creation/final history and Inventory result are persisted.
-- The reply preserves the order correlation ID and product ID.
+- The inventory reply preserves the order correlation ID and product ID.
 - GET-by-ID returns the final status and preserves the exact decimal price in PostgreSQL.
 
 Order MVC tests also cover invalid inputs, malformed JSON, fractional quantities, 404,
 error response privacy, the Location header and exact decimal deserialization.
 
-These tests exercise the baseline happy path and business rejection, not crash recovery,
-duplicate delivery or concurrent stock reservation. Invalid input is covered by MVC tests.
+Inventory service tests also exercise duplicate delivery, concurrent duplicate delivery,
+same-order redelivery, same-order conflict handling, failed-decision stability, concurrent
+stock reservation without overselling, transaction rollback, outbox retry and expired-claim
+recovery against PostgreSQL/Testcontainers. Invalid input is covered by MVC tests.
 
 Reports: each module's `target/surefire-reports`, plus
 `integration-tests/target/failsafe-reports`. Application logs:
@@ -116,6 +123,13 @@ Services: Order `8081`, Inventory `8082`, Kafka `9092`, Kafka UI `8080`,
 Order PostgreSQL `5432`, Inventory PostgreSQL `5433`, pgAdmin `5050`.
 The Compose credentials are local-demo defaults. Do not expose this setup publicly.
 
+Seed demo inventory explicitly before creating orders. Production startup does not insert
+stock automatically:
+
+```sh
+docker compose exec -T postgres-inventory psql -U admin -d inventorydb -c "insert into inventory(product_id, available_quantity, reserved_quantity) values ('product-1', 20, 0) on conflict (product_id) do update set available_quantity = excluded.available_quantity, reserved_quantity = excluded.reserved_quantity;"
+```
+
 Create a successful order in PowerShell:
 
 ```powershell
@@ -124,7 +138,8 @@ $order = Invoke-RestMethod -Method Post -Uri 'http://localhost:8081/api/orders' 
 $order
 ```
 
-Repeat with `quantity=11` to exercise rejection. Bash equivalent:
+Repeat with `quantity=11`; with the stock seed above it succeeds. Use a quantity above
+available stock, or an unseeded product, to exercise business rejection. Bash equivalent:
 
 ```sh
 curl -H 'Content-Type: application/json' -d '{"productId":"product-1","customerId":"customer-1","quantity":2,"price":12.50}' http://localhost:8081/api/orders
@@ -141,7 +156,9 @@ Allow at least one relay cycle (five seconds). You can also inspect database his
 ```sh
 docker compose exec -T postgres-order psql -U admin -d orderdb -c "select order_id, quantity, status from orders order by created_at desc limit 10;"
 docker compose exec -T postgres-order psql -U admin -d orderdb -c "select aggregate_id, status from outbox_events order by created_at desc limit 10;"
-docker compose exec -T postgres-inventory psql -U admin -d inventorydb -c "select aggregate_id, event_type from event_store order by occurred_at desc limit 10;"
+docker compose exec -T postgres-inventory psql -U admin -d inventorydb -c "select product_id, available_quantity, reserved_quantity from inventory order by product_id;"
+docker compose exec -T postgres-inventory psql -U admin -d inventorydb -c "select order_id, product_id, quantity, status from inventory_reservation_decisions order by decided_at desc limit 10;"
+docker compose exec -T postgres-inventory psql -U admin -d inventorydb -c "select aggregate_id, event_type, status from inventory_outbox_events order by created_at desc limit 10;"
 ```
 
 Stop the Java processes with Ctrl+C, then run `docker compose down`. This preserves the
@@ -150,11 +167,27 @@ Integration tests always start with fresh, separate databases; no local volume d
 
 ## Current limitations
 
-Real inventory, idempotency, reliable reply publication,
-outbox retry/recovery and Saga timeouts remain future work. `event_store` is audit history,
-not a full event-sourced system. Flyway manages schema and Hibernate validates it.
-The two existing application-class unit tests are not context-startup tests; actual startup
-is covered by the packaged-application integration suite.
+Inventory reservation is real and guarded by an atomic conditional PostgreSQL update.
+Inventory Inbox deduplicates by `eventId`; a duplicate `eventId` with different content is
+treated as an invalid message and sent through the configured Kafka error handler/DLT path.
+Per-order decisions prevent re-deciding the same order: a new event with the same `orderId`,
+`productId` and `quantity` keeps the existing decision, while a different product or
+quantity is treated as a conflict and no ordinary inventory reply is emitted.
+
+Inventory replies are stored in `inventory_outbox_events` before publication. The relay uses
+bounded batches, claim tokens, leases, exponential backoff and max attempts. Kafka key is the
+`orderId`; retry keeps the same reply `eventId`, payload and correlation ID. Expired
+`IN_PROGRESS` claims become claimable after the lease. `FAILED` outbox rows require an
+operator decision: inspect `last_error` and the stable `payload`; after correcting the cause,
+set `status='PENDING'`, clear claim fields, reset or adjust `attempt_count`, and set
+`next_attempt_at=now()` in a controlled maintenance window. No automatic replay API is
+provided in this stage.
+
+The `order-service` reply consumer is still intentionally limited: it does not yet have its
+own Inbox or strict state machine, so duplicate inventory replies can append duplicate order
+history and reapply the same terminal status. That hardening belongs to the next stage.
+Saga timeouts also remain future work. `event_store` is audit history, not a full
+event-sourced system. Flyway manages schema and Hibernate validates it.
 
 ## Order API (stage 2)
 
@@ -193,6 +226,10 @@ The migration index choices are intentionally narrow:
 
 - `outbox_events(status)`: supports the current relay query for pending outbox rows.
 - `event_store(aggregate_id, version)`: supports aggregate history reads ordered by version.
+- `inventory_inbox_events(event_id)`: prevents duplicate event processing.
+- `inventory_reservation_decisions(order_id)`: prevents re-deciding an order.
+- `inventory_outbox_events(status, next_attempt_at, created_at, id)` and
+  `(status, claimed_until, created_at, id)`: support relay claims and expired lease recovery.
 
 No unique constraint is placed on event version yet because the current version allocation is
 not concurrency-safe. `sent_at` remains nullable because pending and failed outbox rows have

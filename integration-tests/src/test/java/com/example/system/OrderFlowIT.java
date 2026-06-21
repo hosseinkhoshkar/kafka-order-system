@@ -2,6 +2,8 @@ package com.example.system;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.kafka.clients.admin.AdminClient;
+import org.apache.kafka.clients.admin.NewTopic;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -24,6 +26,7 @@ import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
@@ -56,6 +59,7 @@ class OrderFlowIT {
     static void startApplications() throws Exception {
         Files.createDirectories(LOGS);
         try {
+            createTopics();
             start("inventory-service", INVENTORY_DB);
             start("order-service", ORDER_DB);
             awaitPort("inventory-service", APPLICATIONS.get(0));
@@ -84,9 +88,23 @@ class OrderFlowIT {
                 "--spring.kafka.bootstrap-servers=" + KAFKA.getBootstrapServers(),
                 "--spring.jpa.hibernate.ddl-auto=validate",
                 "--spring.jpa.show-sql=false",
-                "--spring.main.banner-mode=off");
+                "--spring.main.banner-mode=off",
+                "--outbox.relay.poll-interval-ms=1000",
+                "--inventory.outbox.relay.poll-interval-ms=1000");
         APPLICATIONS.add(new ProcessBuilder(command).directory(ROOT.toFile())
                 .redirectErrorStream(true).redirectOutput(LOGS.resolve(service + ".log").toFile()).start());
+    }
+
+    private static void createTopics() throws Exception {
+        Properties properties = new Properties();
+        properties.put("bootstrap.servers", KAFKA.getBootstrapServers());
+        try (AdminClient admin = AdminClient.create(properties)) {
+            admin.createTopics(List.of(
+                    new NewTopic("orders", 1, (short) 1),
+                    new NewTopic("inventory-reply", 1, (short) 1),
+                    new NewTopic("orders.DLT", 1, (short) 1)
+            )).all().get(30, TimeUnit.SECONDS);
+        }
     }
 
     private static int awaitPort(String service, Process application) {
@@ -106,14 +124,19 @@ class OrderFlowIT {
         return result[0];
     }
 
-    @ParameterizedTest(name = "quantity {0} eventually becomes {1}")
+    @ParameterizedTest(name = "quantity {0} with stock {1} eventually becomes {2}")
     @CsvSource({
-            "2, CONFIRMED, INVENTORY_RESERVED, ORDER_CONFIRMED",
-            "11, CANCELLED, INVENTORY_RESERVATION_FAILED, ORDER_CANCELLED"
+            "2, 10, CONFIRMED, INVENTORY_RESERVED, ORDER_CONFIRMED",
+            "11, 20, CONFIRMED, INVENTORY_RESERVED, ORDER_CONFIRMED",
+            "21, 20, CANCELLED, INVENTORY_RESERVATION_FAILED, ORDER_CANCELLED"
     })
-    void orderTraversesOutboxKafkaInventoryAndReply(int quantity, String status,
+    void orderTraversesOutboxKafkaInventoryAndReply(int quantity, int initialStock, String status,
                                                    String inventoryEvent, String orderEvent) throws Exception {
         String product = "product-" + UUID.randomUUID();
+        execute(INVENTORY_DB, """
+                insert into inventory(product_id, available_quantity, reserved_quantity)
+                values (?, ?, 0)
+                """, product, initialStock);
         String body = JSON.writeValueAsString(Map.of("productId", product,
                 "customerId", "customer-test", "quantity", quantity, "price", new BigDecimal("123456789012345.67")));
         HttpResponse<String> response = HTTP.send(HttpRequest.newBuilder(
@@ -156,6 +179,9 @@ class OrderFlowIT {
                     assertThat(scalar(INVENTORY_DB,
                             "select count(*) from event_store where aggregate_id = ? and event_type = ?",
                             orderId, inventoryEvent)).isEqualTo("1");
+                    assertThat(Integer.parseInt(scalar(INVENTORY_DB,
+                            "select available_quantity from inventory where product_id = ?", product)))
+                            .isGreaterThanOrEqualTo(0);
                 });
         JsonNode envelope = JSON.readTree(scalar(INVENTORY_DB,
                 "select payload from event_store where aggregate_id = ? and event_type = ?", orderId, inventoryEvent));
@@ -171,6 +197,15 @@ class OrderFlowIT {
             try (var rows = statement.executeQuery()) {
                 return rows.next() ? rows.getString(1) : null;
             }
+        }
+    }
+
+    private static void execute(PostgreSQLContainer<?> database, String sql, Object... parameters) throws Exception {
+        try (var connection = DriverManager.getConnection(database.getJdbcUrl(),
+                database.getUsername(), database.getPassword());
+             var statement = connection.prepareStatement(sql)) {
+            for (int i = 0; i < parameters.length; i++) statement.setObject(i + 1, parameters[i]);
+            statement.executeUpdate();
         }
     }
 

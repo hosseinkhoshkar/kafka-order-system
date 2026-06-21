@@ -40,7 +40,7 @@ class DatabaseMigrationIT {
     void orderMigrationsCreateEmptyDatabaseAndAreRepeatable() throws Exception {
         Flyway flyway = flyway(ORDER_MIGRATIONS);
 
-        assertThat(flyway.migrate().migrationsExecuted).isEqualTo(2);
+        assertThat(flyway.migrate().migrationsExecuted).isEqualTo(3);
         assertThat(flyway.migrate().migrationsExecuted).isZero();
 
         try (Connection connection = connection()) {
@@ -67,11 +67,13 @@ class DatabaseMigrationIT {
     void inventoryMigrationsCreateEmptyDatabaseAndAreRepeatable() throws Exception {
         Flyway flyway = flyway(INVENTORY_MIGRATIONS);
 
-        assertThat(flyway.migrate().migrationsExecuted).isEqualTo(2);
+        assertThat(flyway.migrate().migrationsExecuted).isEqualTo(3);
         assertThat(flyway.migrate().migrationsExecuted).isZero();
 
         try (Connection connection = connection()) {
             assertThat(indexExists(connection, "idx_event_store_aggregate_version")).isTrue();
+            assertThat(indexExists(connection, "idx_inventory_outbox_claim_available")).isTrue();
+            assertThat(indexExists(connection, "idx_inventory_outbox_claim_expired")).isTrue();
             execute(connection, """
                     INSERT INTO inventory(product_id, available_quantity, reserved_quantity)
                     VALUES ('product-ok', 10, 0)
@@ -149,6 +151,24 @@ class DatabaseMigrationIT {
             assertThat(scalar(connection, "SELECT available_quantity FROM inventory WHERE product_id = 'product-1'"))
                     .isEqualTo("10");
             assertThat(indexExists(connection, "idx_event_store_aggregate_version")).isTrue();
+            execute(connection, """
+                    INSERT INTO inventory_inbox_events(event_id, event_type, aggregate_id, payload_hash, received_at)
+                    VALUES ('event-1', 'ORDER_CREATED', 'order-1', repeat('a', 64), now())
+                    """);
+            execute(connection, """
+                    INSERT INTO inventory_reservation_decisions(
+                        order_id, source_event_id, product_id, quantity, status,
+                        failure_reason, response_event_id, decided_at)
+                    VALUES ('order-1', 'event-1', 'product-1', 2, 'RESERVED',
+                        NULL, 'reply-1', now())
+                    """);
+            execute(connection, """
+                    INSERT INTO inventory_outbox_events(
+                        id, aggregate_id, aggregate_type, event_type, payload, status,
+                        created_at, attempt_count, next_attempt_at)
+                    VALUES ('reply-1', 'order-1', 'INVENTORY', 'INVENTORY_RESERVED',
+                        '{}', 'PENDING', now(), 0, now())
+                    """);
         }
     }
 
