@@ -1,66 +1,36 @@
 package com.example.orderservice.consumer;
 
 import com.example.common.event.EventEnvelope;
-import com.example.common.event.EventTypes;
-import com.example.common.event.InventoryReservationFailedEvent;
-import com.example.orderservice.entity.OrderEntity;
-import com.example.orderservice.model.OrderStatus;
-import com.example.orderservice.repository.OrderRepository;
-import com.example.orderservice.service.EventStoreService;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import com.example.orderservice.service.InventoryReplyProcessingResult;
+import com.example.orderservice.service.InventoryReplyService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Service;
 
-import java.time.LocalDateTime;
-import java.util.Optional;
-
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class SagaReplyConsumer {
 
-    private final OrderRepository orderRepository;
-    private final EventStoreService eventStoreService;
-    private final ObjectMapper objectMapper;
+    private final InventoryReplyService inventoryReplyService;
 
-    @KafkaListener(topics = "${kafka.topic.inventory-reply}", groupId = "order-group")
+    @KafkaListener(topics = "${kafka.topic.inventory-reply}", groupId = "${kafka.consumer.group.order}")
     public void consumeInventoryReply(ConsumerRecord<String, EventEnvelope> record) {
         EventEnvelope reply = record.value();
+        InventoryReplyProcessingResult result = inventoryReplyService.process(reply);
+        log.info("Inventory reply processed | orderId: {} | outcome: {} | partition: {} | offset: {}",
+                result.orderId(), result.outcome(), record.partition(), record.offset());
+    }
 
-        log.info("Inventory reply received | orderId: {} | eventType: {}",
-                reply.aggregateId(), reply.eventType());
-
-        Optional<OrderEntity> orderOpt = orderRepository.findById(reply.aggregateId());
-
-        if (orderOpt.isEmpty()) {
-            log.error("Order not found in DB | orderId: {}", reply.aggregateId());
-            return;
-        }
-
-        OrderEntity order = orderOpt.get();
-
-        if (EventTypes.INVENTORY_RESERVED.equals(reply.eventType())) {
-            order.setStatus(OrderStatus.CONFIRMED);
-            eventStoreService.saveEvent(order.getOrderId(), "ORDER", "ORDER_CONFIRMED", reply);
-            log.info("Order CONFIRMED | orderId: {}", reply.aggregateId());
-        } else if (EventTypes.INVENTORY_RESERVATION_FAILED.equals(reply.eventType())) {
-            order.setStatus(OrderStatus.CANCELLED);
-            eventStoreService.saveEvent(order.getOrderId(), "ORDER", "ORDER_CANCELLED", reply);
-            InventoryReservationFailedEvent failedEvent =
-                    objectMapper.convertValue(reply.payload(), InventoryReservationFailedEvent.class);
-            log.warn("Order CANCELLED | orderId: {} | reason: {}",
-                    reply.aggregateId(), failedEvent.reason());
-        } else {
-            log.warn("Ignoring unsupported inventory reply event type: {}", reply.eventType());
-            return;
-        }
-
-        order.setUpdatedAt(LocalDateTime.now());
-        orderRepository.save(order);
-        log.info("Order status updated in DB | orderId: {} | status: {}",
-                order.getOrderId(), order.getStatus());
+    @KafkaListener(
+            topics = "${kafka.topic.inventory-reply-dlt}",
+            groupId = "${kafka.consumer.group.order-dlt}",
+            containerFactory = "byteArrayKafkaListenerContainerFactory")
+    public void consumeDeadLetter(ConsumerRecord<String, byte[]> record) {
+        log.error("Inventory reply DLT observed | key: {} | topic: {} | partition: {} | offset: {} | bytes: {}",
+                record.key(), record.topic(), record.partition(), record.offset(),
+                record.value() == null ? 0 : record.value().length);
     }
 }

@@ -1,0 +1,15 @@
+{
+  "eventId": "event-inventory-failed-1",
+  "eventType": "INVENTORY_RESERVATION_FAILED",
+  "aggregateId": "order-1",
+  "aggregateType": "INVENTORY",
+  "occurredAt": "2026-09-24T12:00:01",
+  "schemaVersion": 1,
+  "correlationId": "order-1",
+  "payload": {
+    "orderId": "order-1",
+    "productId": "product-1",
+    "quantity": 2,
+    "reason": "Insufficient inventory for: product-1"
+  }
+}

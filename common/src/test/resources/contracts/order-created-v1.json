@@ -1,0 +1,18 @@
+{
+  "eventId": "event-order-created-1",
+  "eventType": "ORDER_CREATED",
+  "aggregateId": "order-1",
+  "aggregateType": "ORDER",
+  "occurredAt": "2026-09-24T12:00:00",
+  "schemaVersion": 1,
+  "correlationId": "order-1",
+  "payload": {
+    "orderId": "order-1",
+    "productId": "product-1",
+    "customerId": "customer-1",
+    "quantity": 2,
+    "price": 12.50,
+    "status": "PENDING",
+    "createdAt": "2026-09-24T12:00:00"
+  }
+}

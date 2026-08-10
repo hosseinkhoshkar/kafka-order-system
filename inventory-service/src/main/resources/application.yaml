@@ -31,7 +31,17 @@ spring:
 kafka:
   topic:
     orders: orders
+    orders-dlt: orders.DLT
     inventory-reply: inventory-reply
+    inventory-reply-dlt: inventory-reply.DLT
+  consumer:
+    group:
+      inventory: inventory-group
+      inventory-dlt: inventory-group-dlt
+    error:
+      max-attempts: 3
+      backoff-ms: 1000
+      dlt-send-timeout: PT10S
 
 inventory:
   outbox:

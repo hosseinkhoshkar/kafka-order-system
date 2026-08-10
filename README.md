@@ -3,8 +3,9 @@
 Java 17 / Spring Boot demo of an asynchronous order workflow with Kafka and PostgreSQL.
 Inventory is reserved from persisted stock in `inventorydb`. Kafka delivery is treated as
 at-least-once: duplicate order events are ignored by inventory Inbox and per-order decision
-records, and inventory replies are published through a recoverable Inventory Outbox. This
-baseline does not claim production readiness or exactly-once delivery.
+records, and inventory replies are published through a recoverable Inventory Outbox. Kafka
+consumer failures use bounded retry, Dead Letter Topics and a controlled single-record replay
+tool. This baseline does not claim production readiness or exactly-once delivery.
 
 ## Modules and flow
 
@@ -12,6 +13,8 @@ baseline does not claim production readiness or exactly-once delivery.
 - `order-service`: HTTP API, order database, event history, scheduled outbox relay and reply consumer.
 - `inventory-service`: order consumer, persisted inventory reservation, Inbox, decision log,
   event history and scheduled reply outbox relay.
+- `kafka-replay-tool`: CLI-only operator tool for dry-run inspection and explicit replay of
+  one DLT record by topic, partition and offset.
 - `integration-tests`: test-only module; launches both packaged applications with isolated infrastructure.
 
 ```text
@@ -72,6 +75,10 @@ The integration suite checks:
 - Outbox reaches `SENT`; Order creation/final history and Inventory result are persisted.
 - The inventory reply preserves the order correlation ID and product ID.
 - GET-by-ID returns the final status and preserves the exact decimal price in PostgreSQL.
+- Malformed Kafka JSON reaches the configured DLT with its original bytes and a following
+  valid record from the same topic can still be consumed.
+- The replay tool dry-run does not publish, and `--execute` republishes only the selected
+  DLT record to a configured destination while preserving key and payload bytes.
 
 Order MVC tests also cover invalid inputs, malformed JSON, fractional quantities, 404,
 error response privacy, the Location header and exact decimal deserialization.
@@ -104,6 +111,7 @@ For predictable demo topic creation, run once the broker is ready:
 docker compose exec -T kafka kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic orders --partitions 1 --replication-factor 1
 docker compose exec -T kafka kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic inventory-reply --partitions 1 --replication-factor 1
 docker compose exec -T kafka kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic orders.DLT --partitions 1 --replication-factor 1
+docker compose exec -T kafka kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic inventory-reply.DLT --partitions 1 --replication-factor 1
 ```
 
 Build the jars with unit tests (the full verification command above also builds them):
@@ -165,6 +173,106 @@ Stop the Java processes with Ctrl+C, then run `docker compose down`. This preser
 PostgreSQL volumes. Kafka has no persistent volume in the current Compose configuration.
 Integration tests always start with fresh, separate databases; no local volume deletion is needed.
 
+## Kafka failure handling and replay runbook
+
+### Error policy
+
+| Failure | Consumer behavior |
+| --- | --- |
+| Temporary infrastructure failure, for example transient database or broker access during listener processing | Retry with fixed backoff, then DLT after `kafka.consumer.error.max-attempts` total delivery attempts. |
+| Malformed JSON or deserialization failure before the listener | No business retry. The original raw bytes are sent to DLT through `ErrorHandlingDeserializer` and `DeadLetterPublishingRecoverer`. |
+| Valid envelope with unsupported `schemaVersion`, missing required envelope/payload fields, invalid quantity or type mismatch | Non-retryable contract error; send to DLT. Unknown optional fields remain compatible. |
+| Duplicate `eventId` with different payload hash or same order with conflicting product/quantity | Non-retryable permanent conflict; send to DLT. |
+| Insufficient or missing inventory | Normal business result. Inventory emits `INVENTORY_RESERVATION_FAILED`; it is not a DLT condition. |
+| Inventory reply for a missing order | Limited retry, then `inventory-reply.DLT`. In the normal outbox flow the order row is committed before `ORDER_CREATED` is published, so a persistent missing order indicates data corruption, restore lag, or an out-of-band message. |
+| Unexpected null/tombstone value on application topics | Treated as an invalid message and sent to DLT without a listener null pointer loop. |
+
+Config:
+
+```yaml
+kafka.consumer.error.max-attempts: 3
+kafka.consumer.error.backoff-ms: 1000
+kafka.consumer.error.dlt-send-timeout: PT10S
+```
+
+`max-attempts` is the initial listener call plus retries. The Spring Kafka error handler
+pauses/sleeps the listener thread for blocking retry, so large backoff values delay later
+records in the same partition and must remain comfortably below `max.poll.interval.ms`.
+
+### Topics and DLTs
+
+| Source topic | Consumer group | DLT | Partition rule |
+| --- | --- | --- | --- |
+| `orders` | `inventory-group` | `orders.DLT` | Same partition as the failed source record. |
+| `inventory-reply` | `order-group` | `inventory-reply.DLT` | Same partition as the failed source record. |
+
+Create DLTs with at least the same partition count as their source topics. Configure retention
+long enough for investigation and audit; for the local demo, create them manually with the
+commands above. DLT publication keeps the original key and payload. Spring Kafka DLT headers
+record original topic, partition, offset, consumer group and sanitized exception information;
+stack traces are excluded from DLT headers to avoid leaking sensitive details and unbounded
+header growth.
+
+The simple DLT listeners only log that a DLT record exists. They are not a management UI and
+they do not replay records automatically.
+
+### Replay one DLT record
+
+Build the tool:
+
+```powershell
+$env:JAVA_HOME='C:\path\to\jdk17'
+$env:Path="$env:JAVA_HOME\bin;$env:Path"
+.\order-service\mvnw.cmd -B -ntp -f pom.xml -pl kafka-replay-tool -am package
+```
+
+Dry-run is the default and does not commit offsets or publish:
+
+```powershell
+java -jar .\kafka-replay-tool\target\kafka-replay-tool.jar `
+  --bootstrap-servers localhost:9092 `
+  --dlt-topic orders.DLT `
+  --partition 0 `
+  --offset 42
+```
+
+Execute requires an explicit flag:
+
+```powershell
+java -jar .\kafka-replay-tool\target\kafka-replay-tool.jar `
+  --bootstrap-servers localhost:9092 `
+  --dlt-topic orders.DLT `
+  --partition 0 `
+  --offset 42 `
+  --execute
+```
+
+Trusted destinations live in `ops/replay.properties`:
+
+```properties
+replay.destination.orders.DLT=orders
+replay.destination.inventory-reply.DLT=inventory-reply
+```
+
+The DLT record header is never allowed to choose an arbitrary destination. Replay uses its own
+temporary consumer group, `assign/seek`, does not commit application offsets and does not delete
+the DLT record. It preserves key, payload bytes, `eventId` and `correlationId`; it removes Kafka
+error/retry control headers and adds `x-replay-*` audit headers. Repeated `--execute` can publish
+duplicates, so business safety depends on Inbox and domain idempotency. A timeout after send means
+the result is unknown; the tool does not provide exactly-once replay guarantees.
+
+Replay is appropriate after the root cause has been corrected, for example a temporary database
+outage or a fixed consumer bug. Replaying malformed JSON or an unsupported schema version without
+fixing the payload or consumer support only sends the same bad message through the same failure path.
+
+### Kafka DLT vs Outbox FAILED
+
+Kafka DLT records are failed consumed messages. They preserve broker source metadata and are
+replayed with the CLI above. Outbox `FAILED` rows are failed publications from a service database
+to Kafka; their recovery path is database/operator controlled: inspect `last_error` and the stable
+outbox payload, fix the cause, then intentionally move the row back to `PENDING` or compensate.
+Do not treat an outbox row as a Kafka DLT record.
+
 ## Current limitations
 
 Inventory reservation is real and guarded by an atomic conditional PostgreSQL update.
@@ -183,11 +291,11 @@ set `status='PENDING'`, clear claim fields, reset or adjust `attempt_count`, and
 `next_attempt_at=now()` in a controlled maintenance window. No automatic replay API is
 provided in this stage.
 
-The `order-service` reply consumer is still intentionally limited: it does not yet have its
-own Inbox or strict state machine, so duplicate inventory replies can append duplicate order
-history and reapply the same terminal status. That hardening belongs to the next stage.
-Saga timeouts also remain future work. `event_store` is audit history, not a full
-event-sourced system. Flyway manages schema and Hibernate validates it.
+The `order-service` reply consumer now uses its Inbox and status transition service for duplicate
+inventory replies. The codebase contains the `order_idempotency_keys` schema/entity/repository,
+but the HTTP controller still does not enforce an `Idempotency-Key` header. That gap is not part
+of the Kafka DLT/replay path. Saga timeouts also remain future work. `event_store` is audit
+history, not a full event-sourced system. Flyway manages schema and Hibernate validates it.
 
 ## Order API (stage 2)
 

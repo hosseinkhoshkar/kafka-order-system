@@ -1,6 +1,7 @@
 package com.example.inventoryservice.service;
 
 import com.example.common.event.EventEnvelope;
+import com.example.common.event.EventSchemaVersions;
 import com.example.common.event.EventTypes;
 import com.example.common.event.InventoryReservationFailedEvent;
 import com.example.common.event.InventoryReservedEvent;
@@ -31,7 +32,6 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class InventoryReservationService {
 
-    private static final int SUPPORTED_SCHEMA_VERSION = 1;
     private static final String AGGREGATE_TYPE = "INVENTORY";
     private static final String STATUS_RESERVED = "RESERVED";
     private static final String STATUS_FAILED = "FAILED";
@@ -94,7 +94,7 @@ public class InventoryReservationService {
                 order.orderId(),
                 AGGREGATE_TYPE,
                 now,
-                SUPPORTED_SCHEMA_VERSION,
+                EventSchemaVersions.V1,
                 sourceEnvelope.correlationId(),
                 reply.payload()
         );
@@ -149,7 +149,7 @@ public class InventoryReservationService {
         if (!EventTypes.ORDER_CREATED.equals(envelope.eventType())) {
             throw new InvalidInventoryMessageException("Unsupported event type: " + envelope.eventType());
         }
-        if (envelope.schemaVersion() != SUPPORTED_SCHEMA_VERSION) {
+        if (envelope.schemaVersion() != EventSchemaVersions.V1) {
             throw new InvalidInventoryMessageException("Unsupported schema version: " + envelope.schemaVersion());
         }
         if (envelope.payload() == null) {

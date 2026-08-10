@@ -7,6 +7,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
+import java.time.Clock;
 import java.time.LocalDateTime;
 import java.util.UUID;
 
@@ -17,11 +18,12 @@ public class OutboxEventService {
 
     private final OutboxEventRepository outboxEventRepository;
     private final ObjectMapper objectMapper;
+    private final Clock clock;
 
     public void saveOutboxEvent(String aggregateId, String aggregateType,
                                 String eventType, Object payload) {
         try {
-            LocalDateTime now = LocalDateTime.now();
+            LocalDateTime now = LocalDateTime.now(clock);
             OutboxEvent outboxEvent = OutboxEvent.builder()
                     .id(UUID.randomUUID().toString())
                     .aggregateId(aggregateId)

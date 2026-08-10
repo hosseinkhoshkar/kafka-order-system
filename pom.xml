@@ -24,6 +24,7 @@
         <module>common</module>
         <module>order-service</module>
         <module>inventory-service</module>
+        <module>kafka-replay-tool</module>
         <module>integration-tests</module>
     </modules>
 

@@ -16,7 +16,7 @@ public class InventoryConsumer {
 
     private final InventoryReservationService inventoryReservationService;
 
-    @KafkaListener(topics = "${kafka.topic.orders}", groupId = "inventory-group")
+    @KafkaListener(topics = "${kafka.topic.orders}", groupId = "${kafka.consumer.group.inventory}")
     public void consumeOrder(ConsumerRecord<String, EventEnvelope> record) {
         EventEnvelope envelope = record.value();
         log.info("Order event received | eventId: {} | aggregateId: {} | partition: {} | offset: {}",
@@ -31,12 +31,13 @@ public class InventoryConsumer {
                 result.orderId(), result.outcome());
     }
 
-    @KafkaListener(topics = "orders.DLT", groupId = "inventory-group-dlt")
-    public void consumeDeadLetter(ConsumerRecord<String, EventEnvelope> record) {
-        EventEnvelope envelope = record.value();
-        log.error("Dead Letter received | aggregateId: {} | eventType: {}",
-                envelope == null ? null : envelope.aggregateId(),
-                envelope == null ? null : envelope.eventType()
-        );
+    @KafkaListener(
+            topics = "${kafka.topic.orders-dlt}",
+            groupId = "${kafka.consumer.group.inventory-dlt}",
+            containerFactory = "byteArrayKafkaListenerContainerFactory")
+    public void consumeDeadLetter(ConsumerRecord<String, byte[]> record) {
+        log.error("Order DLT observed | key: {} | topic: {} | partition: {} | offset: {} | bytes: {}",
+                record.key(), record.topic(), record.partition(), record.offset(),
+                record.value() == null ? 0 : record.value().length);
     }
 }

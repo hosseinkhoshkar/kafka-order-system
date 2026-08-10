@@ -40,13 +40,14 @@ class DatabaseMigrationIT {
     void orderMigrationsCreateEmptyDatabaseAndAreRepeatable() throws Exception {
         Flyway flyway = flyway(ORDER_MIGRATIONS);
 
-        assertThat(flyway.migrate().migrationsExecuted).isEqualTo(3);
+        assertThat(flyway.migrate().migrationsExecuted).isEqualTo(4);
         assertThat(flyway.migrate().migrationsExecuted).isZero();
 
         try (Connection connection = connection()) {
             assertThat(columnType(connection, "orders", "price")).isEqualTo("numeric");
             assertThat(indexExists(connection, "idx_outbox_events_status")).isTrue();
             assertThat(indexExists(connection, "idx_event_store_aggregate_version")).isTrue();
+            assertThat(indexExists(connection, "idx_order_inbox_aggregate")).isTrue();
 
             execute(connection, """
                     INSERT INTO orders(order_id, product_id, customer_id, quantity, price, status, created_at, updated_at)
@@ -112,6 +113,7 @@ class DatabaseMigrationIT {
                     .isEqualByComparingTo("12.34");
             assertThat(indexExists(connection, "idx_outbox_events_status")).isTrue();
             assertThat(indexExists(connection, "idx_event_store_aggregate_version")).isTrue();
+            assertThat(indexExists(connection, "idx_order_inbox_aggregate")).isTrue();
         }
     }
 

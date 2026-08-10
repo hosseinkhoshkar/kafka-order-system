@@ -1,6 +1,7 @@
 package com.example.orderservice.service;
 
 import com.example.common.event.EventEnvelope;
+import com.example.common.event.EventSchemaVersions;
 import com.example.common.event.EventTypes;
 import com.example.common.event.InventoryReservationFailedEvent;
 import com.example.common.event.InventoryReservedEvent;
@@ -28,8 +29,6 @@ import java.util.Objects;
 @Service
 @RequiredArgsConstructor
 public class InventoryReplyService {
-
-    private static final int SUPPORTED_SCHEMA_VERSION = 1;
 
     private final OrderInboxEventRepository inboxRepository;
     private final OrderRepository orderRepository;
@@ -92,7 +91,7 @@ public class InventoryReplyService {
                 && !EventTypes.INVENTORY_RESERVATION_FAILED.equals(envelope.eventType())) {
             throw new InvalidInventoryReplyException("Unsupported inventory reply type: " + envelope.eventType());
         }
-        if (envelope.schemaVersion() != SUPPORTED_SCHEMA_VERSION) {
+        if (envelope.schemaVersion() != EventSchemaVersions.V1) {
             throw new InvalidInventoryReplyException("Unsupported inventory reply schema version: " + envelope.schemaVersion());
         }
         if (envelope.payload() == null) {

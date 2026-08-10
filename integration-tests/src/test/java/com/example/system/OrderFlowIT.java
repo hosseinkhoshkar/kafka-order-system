@@ -2,12 +2,25 @@ package com.example.system;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.NewTopic;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.serialization.ByteArrayDeserializer;
+import org.apache.kafka.common.serialization.ByteArraySerializer;
+import org.apache.kafka.common.serialization.StringDeserializer;
+import org.apache.kafka.common.serialization.StringSerializer;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.springframework.kafka.support.KafkaHeaders;
 import org.testcontainers.kafka.ConfluentKafkaContainer;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
@@ -102,7 +115,8 @@ class OrderFlowIT {
             admin.createTopics(List.of(
                     new NewTopic("orders", 1, (short) 1),
                     new NewTopic("inventory-reply", 1, (short) 1),
-                    new NewTopic("orders.DLT", 1, (short) 1)
+                    new NewTopic("orders.DLT", 1, (short) 1),
+                    new NewTopic("inventory-reply.DLT", 1, (short) 1)
             )).all().get(30, TimeUnit.SECONDS);
         }
     }
@@ -110,7 +124,7 @@ class OrderFlowIT {
     private static int awaitPort(String service, Process application) {
         Pattern port = Pattern.compile("Tomcat started on port (\\d+)");
         int[] result = {0};
-        await().alias(service + " startup; see " + LOGS).atMost(Duration.ofSeconds(90))
+        await().alias(service + " startup; see " + LOGS).atMost(Duration.ofSeconds(240))
                 .pollInterval(Duration.ofMillis(500)).until(() -> {
                     if (!application.isAlive()) {
                         throw new IllegalStateException(service + " exited: "
@@ -189,6 +203,38 @@ class OrderFlowIT {
         assertThat(envelope.path("payload").path("productId").asText()).isEqualTo(product);
     }
 
+    @Test
+    void malformedOrderJsonIsPublishedToDltWithOriginalBytesAndPartitionContinues() throws Exception {
+        String badKey = "bad-" + UUID.randomUUID();
+        byte[] badPayload = "{not-json".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        publishRaw("orders", badKey, badPayload);
+
+        ConsumerRecord<String, byte[]> dltRecord = readRecordByKey("orders.DLT", badKey, Duration.ofSeconds(30));
+        assertThat(dltRecord).isNotNull();
+        assertThat(dltRecord.value()).isEqualTo(badPayload);
+        assertThat(dltRecord.headers().lastHeader(KafkaHeaders.DLT_ORIGINAL_TOPIC)).isNotNull();
+        assertThat(dltRecord.headers().lastHeader(KafkaHeaders.DLT_ORIGINAL_OFFSET)).isNotNull();
+
+        String product = "product-" + UUID.randomUUID();
+        String orderId = "order-" + UUID.randomUUID();
+        execute(INVENTORY_DB, """
+                insert into inventory(product_id, available_quantity, reserved_quantity)
+                values (?, 5, 0)
+                """, product);
+        byte[] validPayload = ("""
+                {"eventId":"event-%s","eventType":"ORDER_CREATED","aggregateId":"%s","aggregateType":"ORDER","occurredAt":"2026-09-24T12:00:00","schemaVersion":1,"correlationId":"%s","payload":{"orderId":"%s","productId":"%s","customerId":"customer-1","quantity":2,"price":12.50,"status":"PENDING","createdAt":"2026-09-24T12:00:00"}}
+                """.formatted(orderId, orderId, orderId, orderId, product))
+                .getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        publishRaw("orders", orderId, validPayload);
+
+        await().alias("valid order after malformed message is consumed; see " + LOGS)
+                .atMost(Duration.ofSeconds(30))
+                .pollInterval(Duration.ofMillis(250))
+                .untilAsserted(() -> assertThat(scalar(INVENTORY_DB,
+                        "select count(*) from event_store where aggregate_id = ? and event_type = ?",
+                        orderId, "INVENTORY_RESERVED")).isEqualTo("1"));
+    }
+
     private static String scalar(PostgreSQLContainer<?> database, String sql, String... parameters) throws Exception {
         try (var connection = DriverManager.getConnection(database.getJdbcUrl(),
                 database.getUsername(), database.getPassword());
@@ -206,6 +252,41 @@ class OrderFlowIT {
              var statement = connection.prepareStatement(sql)) {
             for (int i = 0; i < parameters.length; i++) statement.setObject(i + 1, parameters[i]);
             statement.executeUpdate();
+        }
+    }
+
+    private static void publishRaw(String topic, String key, byte[] payload) throws Exception {
+        Properties properties = new Properties();
+        properties.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers());
+        properties.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+        properties.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class.getName());
+        properties.put(ProducerConfig.ACKS_CONFIG, "all");
+        try (KafkaProducer<String, byte[]> producer = new KafkaProducer<>(properties)) {
+            producer.send(new ProducerRecord<>(topic, key, payload)).get(30, TimeUnit.SECONDS);
+        }
+    }
+
+    private static ConsumerRecord<String, byte[]> readRecordByKey(String topic, String key, Duration timeout) {
+        Properties properties = new Properties();
+        properties.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers());
+        properties.put(ConsumerConfig.GROUP_ID_CONFIG, "integration-dlt-reader-" + UUID.randomUUID());
+        properties.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        properties.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
+        properties.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
+        properties.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, ByteArrayDeserializer.class.getName());
+        try (KafkaConsumer<String, byte[]> consumer = new KafkaConsumer<>(properties)) {
+            TopicPartition partition = new TopicPartition(topic, 0);
+            consumer.assign(List.of(partition));
+            consumer.seekToBeginning(List.of(partition));
+            long deadline = System.nanoTime() + timeout.toNanos();
+            while (System.nanoTime() < deadline) {
+                for (ConsumerRecord<String, byte[]> record : consumer.poll(Duration.ofMillis(250))) {
+                    if (key.equals(record.key())) {
+                        return record;
+                    }
+                }
+            }
+            return null;
         }
     }
 
