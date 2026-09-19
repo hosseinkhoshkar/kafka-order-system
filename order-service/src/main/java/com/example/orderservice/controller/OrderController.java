@@ -2,12 +2,13 @@ package com.example.orderservice.controller;
 
 import com.example.orderservice.dto.OrderRequest;
 import com.example.orderservice.dto.OrderResponse;
+import com.example.orderservice.service.CreateOrderResult;
 import com.example.orderservice.service.OrderService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
-import java.net.URI;
 
 @RestController
 @RequestMapping("/api/orders")
@@ -16,9 +17,18 @@ public class OrderController {
     private final OrderService orderService;
 
     @PostMapping
-    public ResponseEntity<OrderResponse> createOrder(@Valid @RequestBody OrderRequest request) {
-        OrderResponse order = orderService.createOrder(request);
-        return ResponseEntity.created(URI.create("/api/orders/" + order.orderId())).body(order);
+    public ResponseEntity<OrderResponse> createOrder(
+            @RequestHeader(name = "Idempotency-Key", required = false) String idempotencyKey,
+            @Valid @RequestBody OrderRequest request) {
+        CreateOrderResult result = orderService.createOrder(request, idempotencyKey);
+        ResponseEntity.BodyBuilder builder = ResponseEntity.status(HttpStatus.valueOf(result.statusCode()));
+        if (result.location() != null) {
+            builder.header("Location", result.location());
+        }
+        if (result.replayed()) {
+            builder.header("Idempotent-Replay", "true");
+        }
+        return builder.body(result.body());
     }
 
     @GetMapping("/{orderId}")

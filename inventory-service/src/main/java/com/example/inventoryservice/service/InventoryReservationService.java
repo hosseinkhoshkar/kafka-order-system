@@ -10,12 +10,15 @@ import com.example.inventoryservice.entity.InventoryInboxEvent;
 import com.example.inventoryservice.entity.InventoryReservationDecision;
 import com.example.inventoryservice.exception.InvalidInventoryMessageException;
 import com.example.inventoryservice.exception.OrderEventConflictException;
+import com.example.inventoryservice.observability.InventoryObservabilityMetrics;
 import com.example.inventoryservice.repository.InventoryInboxEventRepository;
 import com.example.inventoryservice.repository.InventoryRepository;
 import com.example.inventoryservice.repository.InventoryReservationDecisionRepository;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.slf4j.MDC;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
@@ -29,6 +32,7 @@ import java.util.Objects;
 import java.util.UUID;
 
 @Service
+@Slf4j
 @RequiredArgsConstructor
 public class InventoryReservationService {
 
@@ -43,6 +47,7 @@ public class InventoryReservationService {
     private final InventoryOutboxEventService outboxEventService;
     private final ObjectMapper objectMapper;
     private final Clock clock;
+    private final InventoryObservabilityMetrics metrics;
 
     @Transactional
     public InventoryProcessingResult process(EventEnvelope envelope) {
@@ -65,13 +70,20 @@ public class InventoryReservationService {
                 throw new InvalidInventoryMessageException(
                         "Duplicate eventId has different content: " + envelope.eventId());
             }
+            metrics.inboxDuplicateAfterCommit(envelope.eventType());
             return InventoryProcessingResult.duplicateEvent(order.orderId());
         }
 
-        decisionRepository.lockOrder(order.orderId());
-        return decisionRepository.findById(order.orderId())
-                .map(existing -> existingDecision(existing, order))
-                .orElseGet(() -> createDecision(envelope, order));
+        try (MDC.MDCCloseable orderId = MDC.putCloseable("orderId", order.orderId());
+             MDC.MDCCloseable eventId = MDC.putCloseable("eventId", envelope.eventId());
+             MDC.MDCCloseable correlationId = MDC.putCloseable("correlationId", envelope.correlationId())) {
+            decisionRepository.lockOrder(order.orderId());
+            InventoryProcessingResult result = decisionRepository.findById(order.orderId())
+                    .map(existing -> existingDecision(existing, order))
+                    .orElseGet(() -> createDecision(envelope, order));
+            log.info("Inventory decision completed | outcome: {}", result.outcome());
+            return result;
+        }
     }
 
     private InventoryProcessingResult existingDecision(InventoryReservationDecision existing,
@@ -113,6 +125,7 @@ public class InventoryReservationService {
         eventStoreService.saveEvent(order.orderId(), AGGREGATE_TYPE, reply.eventType(), responseEnvelope);
         outboxEventService.saveOutboxEvent(responseEventId, order.orderId(), AGGREGATE_TYPE,
                 reply.eventType(), responseEnvelope);
+        metrics.reservationResultAfterCommit(reply.success() ? "reserved" : "failed");
         return InventoryProcessingResult.created(order.orderId());
     }
 

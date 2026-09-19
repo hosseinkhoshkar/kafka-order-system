@@ -1,0 +1,20 @@
+groups:
+  - name: kafka-order-system
+    rules:
+      - alert: OrderOutboxOldestUnpublishedTooOld
+        expr: order_outbox_oldest_unpublished_age_seconds > 300
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Order outbox has an unpublished record older than five minutes.
+          description: Development example only. Adjust the threshold for real SLOs and add Alertmanager separately if notifications are required.
+
+      - alert: InventoryOutboxFailedRows
+        expr: inventory_outbox_events{status="FAILED"} > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: Inventory outbox has FAILED rows.
+          description: Inspect last_error and decide whether to reset rows to PENDING or compensate. This rule does not send notifications without Alertmanager.

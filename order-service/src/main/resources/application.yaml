@@ -15,7 +15,7 @@ spring:
     database-platform: org.hibernate.dialect.PostgreSQLDialect
     hibernate:
       ddl-auto: validate
-    show-sql: true
+    show-sql: false
 
   kafka:
     bootstrap-servers: localhost:9092
@@ -48,3 +48,32 @@ outbox:
     initial-backoff: PT2S
     max-backoff: PT1M
     max-attempts: 5
+
+management:
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: never
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics,prometheus
+  health:
+    diskspace:
+      enabled: false
+    probes:
+      enabled: true
+    group:
+      liveness:
+        include: livenessState,ping
+      readiness:
+        include: readinessState,db
+
+observability:
+  outbox:
+    metrics-refresh-ms: 10000
+
+logging:
+  pattern:
+    level: "%5p [orderId:%X{orderId:-} eventId:%X{eventId:-} correlationId:%X{correlationId:-}]"

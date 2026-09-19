@@ -10,11 +10,14 @@ import com.example.orderservice.exception.InvalidInventoryReplyException;
 import com.example.orderservice.exception.InventoryReplyConflictException;
 import com.example.orderservice.exception.OrderNotFoundException;
 import com.example.orderservice.model.OrderStatus;
+import com.example.orderservice.observability.OrderObservabilityMetrics;
 import com.example.orderservice.repository.OrderInboxEventRepository;
 import com.example.orderservice.repository.OrderRepository;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.slf4j.MDC;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
@@ -27,6 +30,7 @@ import java.util.HexFormat;
 import java.util.Objects;
 
 @Service
+@Slf4j
 @RequiredArgsConstructor
 public class InventoryReplyService {
 
@@ -35,6 +39,7 @@ public class InventoryReplyService {
     private final EventStoreService eventStoreService;
     private final ObjectMapper objectMapper;
     private final Clock clock;
+    private final OrderObservabilityMetrics metrics;
 
     @Transactional
     public InventoryReplyProcessingResult process(EventEnvelope envelope) {
@@ -56,29 +61,38 @@ public class InventoryReplyService {
                 throw new InvalidInventoryReplyException(
                         "Duplicate inventory reply eventId has different content: " + envelope.eventId());
             }
+            metrics.inboxDuplicateAfterCommit(envelope.eventType());
             return InventoryReplyProcessingResult.duplicateEvent(details.orderId());
         }
 
-        OrderEntity order = orderRepository.findByIdForUpdate(details.orderId())
-                .orElseThrow(OrderNotFoundException::new);
-        validateAgainstOrder(order, details);
+        try (MDC.MDCCloseable orderId = MDC.putCloseable("orderId", details.orderId());
+             MDC.MDCCloseable eventId = MDC.putCloseable("eventId", envelope.eventId());
+             MDC.MDCCloseable correlationId = MDC.putCloseable("correlationId", envelope.correlationId())) {
+            OrderEntity order = orderRepository.findByIdForUpdate(details.orderId())
+                    .orElseThrow(OrderNotFoundException::new);
+            validateAgainstOrder(order, details);
 
-        OrderStatus targetStatus = targetStatus(envelope.eventType());
-        String orderEventType = orderEventType(envelope.eventType());
-        if (order.getStatus() == OrderStatus.PENDING) {
-            order.setStatus(targetStatus);
-            order.setUpdatedAt(LocalDateTime.now(clock));
-            orderRepository.save(order);
-            eventStoreService.saveEvent(order.getOrderId(), "ORDER", orderEventType, envelope);
-            return InventoryReplyProcessingResult.transitioned(order.getOrderId());
+            OrderStatus targetStatus = targetStatus(envelope.eventType());
+            String orderEventType = orderEventType(envelope.eventType());
+            if (order.getStatus() == OrderStatus.PENDING) {
+                OrderStatus sourceStatus = order.getStatus();
+                order.setStatus(targetStatus);
+                order.setUpdatedAt(LocalDateTime.now(clock));
+                orderRepository.save(order);
+                eventStoreService.saveEvent(order.getOrderId(), "ORDER", orderEventType, envelope);
+                metrics.orderStatusTransitionAfterCommit(sourceStatus.name(), targetStatus.name());
+                log.info("Order finalized from inventory reply | from: {} | to: {}",
+                        sourceStatus, targetStatus);
+                return InventoryReplyProcessingResult.transitioned(order.getOrderId());
+            }
+
+            if (order.getStatus() == targetStatus) {
+                return InventoryReplyProcessingResult.alreadyFinal(order.getOrderId());
+            }
+
+            throw new InventoryReplyConflictException(
+                    "Inventory reply " + envelope.eventId() + " conflicts with final order status " + order.getStatus());
         }
-
-        if (order.getStatus() == targetStatus) {
-            return InventoryReplyProcessingResult.alreadyFinal(order.getOrderId());
-        }
-
-        throw new InventoryReplyConflictException(
-                "Inventory reply " + envelope.eventId() + " conflicts with final order status " + order.getStatus());
     }
 
     private void validateEnvelope(EventEnvelope envelope) {

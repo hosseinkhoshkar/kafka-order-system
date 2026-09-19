@@ -1,0 +1,110 @@
+{
+  "uid": "kafka-order-system",
+  "title": "Kafka Order System",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "HTTP p95 latency",
+      "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, job) (rate(http_server_requests_seconds_bucket[5m])))",
+          "legendFormat": "{{job}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "HTTP 5xx rate",
+      "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8},
+      "targets": [
+        {
+          "expr": "sum by (job) (rate(http_server_requests_seconds_count{status=~\"5..\"}[5m]))",
+          "legendFormat": "{{job}}"
+        }
+      ]
+    },
+    {
+      "type": "bargauge",
+      "title": "Order outbox rows",
+      "gridPos": {"x": 0, "y": 8, "w": 8, "h": 7},
+      "targets": [
+        {
+          "expr": "order_outbox_events",
+          "legendFormat": "{{status}}"
+        }
+      ]
+    },
+    {
+      "type": "bargauge",
+      "title": "Inventory outbox rows",
+      "gridPos": {"x": 8, "y": 8, "w": 8, "h": 7},
+      "targets": [
+        {
+          "expr": "inventory_outbox_events",
+          "legendFormat": "{{status}}"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Oldest unpublished outbox age",
+      "gridPos": {"x": 16, "y": 8, "w": 8, "h": 7},
+      "targets": [
+        {
+          "expr": "max(order_outbox_oldest_unpublished_age_seconds or inventory_outbox_oldest_unpublished_age_seconds)",
+          "legendFormat": "seconds"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Business processing",
+      "gridPos": {"x": 0, "y": 15, "w": 12, "h": 8},
+      "targets": [
+        {
+          "expr": "sum by (result) (rate(inventory_reservations_total[5m]))",
+          "legendFormat": "inventory {{result}}"
+        },
+        {
+          "expr": "sum(rate(order_orders_created_total[5m]))",
+          "legendFormat": "orders created"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Kafka DLT publish and observation",
+      "gridPos": {"x": 12, "y": 15, "w": 12, "h": 8},
+      "targets": [
+        {
+          "expr": "sum by (topic, result) (rate(order_kafka_dlt_publish_total[5m]) or rate(inventory_kafka_dlt_publish_total[5m]))",
+          "legendFormat": "{{topic}} {{result}}"
+        },
+        {
+          "expr": "sum by (topic) (rate(order_kafka_dlt_observed_total[5m]) or rate(inventory_kafka_dlt_observed_total[5m]))",
+          "legendFormat": "{{topic}} observed"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Outbox publish failures",
+      "gridPos": {"x": 0, "y": 23, "w": 24, "h": 8},
+      "targets": [
+        {
+          "expr": "sum by (outcome) (rate(order_outbox_publish_failures_total[5m]) or rate(inventory_outbox_publish_failures_total[5m]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ]
+    }
+  ]
+}

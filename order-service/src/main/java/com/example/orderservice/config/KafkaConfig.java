@@ -2,7 +2,10 @@ package com.example.orderservice.config;
 
 import com.example.common.event.EventEnvelope;
 import com.example.orderservice.model.Order;
+import com.example.orderservice.observability.OrderObservabilityMetrics;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.clients.producer.RecordMetadata;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.common.TopicPartition;
@@ -21,6 +24,7 @@ import org.springframework.kafka.core.DefaultKafkaConsumerFactory;
 import org.springframework.kafka.core.DefaultKafkaProducerFactory;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.core.ProducerFactory;
+import org.springframework.kafka.support.ProducerListener;
 import org.springframework.kafka.listener.DeadLetterPublishingRecoverer;
 import org.springframework.kafka.listener.DefaultErrorHandler;
 import org.springframework.kafka.listener.DeadLetterPublishingRecoverer.HeaderNames.HeadersToAdd;
@@ -83,8 +87,10 @@ public class KafkaConfig {
     }
 
     @Bean
-    public KafkaTemplate<String, Object> objectKafkaTemplate() {
-        return new KafkaTemplate<>(objectProducerFactory());
+    public KafkaTemplate<String, Object> objectKafkaTemplate(OrderObservabilityMetrics metrics) {
+        KafkaTemplate<String, Object> template = new KafkaTemplate<>(objectProducerFactory());
+        template.setProducerListener(dltProducerListener(metrics));
+        return template;
     }
 
     @Bean
@@ -190,5 +196,25 @@ public class KafkaConfig {
             current = current.getCause();
         }
         return current.getClass().getName();
+    }
+
+    private ProducerListener<String, Object> dltProducerListener(OrderObservabilityMetrics metrics) {
+        return new ProducerListener<>() {
+            @Override
+            public void onSuccess(ProducerRecord<String, Object> producerRecord, RecordMetadata recordMetadata) {
+                if (producerRecord.topic().endsWith(".DLT")) {
+                    metrics.dltProducerResult(producerRecord.topic(), "success");
+                }
+            }
+
+            @Override
+            public void onError(ProducerRecord<String, Object> producerRecord,
+                                RecordMetadata recordMetadata,
+                                Exception exception) {
+                if (producerRecord.topic().endsWith(".DLT")) {
+                    metrics.dltProducerResult(producerRecord.topic(), "failure");
+                }
+            }
+        };
     }
 }

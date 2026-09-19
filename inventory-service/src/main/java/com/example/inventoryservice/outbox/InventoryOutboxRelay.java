@@ -2,11 +2,13 @@ package com.example.inventoryservice.outbox;
 
 import com.example.common.event.EventEnvelope;
 import com.example.inventoryservice.entity.InventoryOutboxEvent;
+import com.example.inventoryservice.observability.InventoryObservabilityMetrics;
 import com.example.inventoryservice.repository.InventoryOutboxEventRepository;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.slf4j.MDC;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.kafka.core.KafkaOperations;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -33,6 +35,7 @@ public class InventoryOutboxRelay {
     private final Clock clock;
     private final PlatformTransactionManager transactionManager;
     private final KafkaOperations<String, Object> kafkaTemplate;
+    private final InventoryObservabilityMetrics metrics;
 
     @Value("${kafka.topic.inventory-reply}")
     private String inventoryReplyTopic;
@@ -90,6 +93,7 @@ public class InventoryOutboxRelay {
 
         CompletableFuture<?> sendFuture;
         try {
+            metrics.outboxPublishAttempt(event.getEventType());
             sendFuture = kafkaTemplate.send(inventoryReplyTopic, event.getAggregateId(), envelope);
         } catch (Exception ex) {
             recordFailure(event, "Kafka send failed before acknowledgement: " + ex.getMessage(), false);
@@ -97,10 +101,14 @@ public class InventoryOutboxRelay {
         }
 
         sendFuture.whenComplete((result, ex) -> {
-            if (ex == null) {
-                recordSuccess(event);
-            } else {
-                recordFailure(event, "Kafka send failed: " + ex.getMessage(), false);
+            try (MDC.MDCCloseable orderId = MDC.putCloseable("orderId", event.getAggregateId());
+                 MDC.MDCCloseable eventId = MDC.putCloseable("eventId", envelope.eventId());
+                 MDC.MDCCloseable correlationId = MDC.putCloseable("correlationId", envelope.correlationId())) {
+                if (ex == null) {
+                    recordSuccess(event);
+                } else {
+                    recordFailure(event, "Kafka send failed: " + ex.getMessage(), false);
+                }
             }
         });
     }
@@ -113,6 +121,8 @@ public class InventoryOutboxRelay {
             if (updated == null || updated == 0) {
                 log.warn("Inventory outbox SENT update skipped | id: {} | token: {}",
                         event.getId(), event.getClaimToken());
+            } else {
+                metrics.outboxPublishSuccess(event.getEventType());
             }
         } catch (Exception ex) {
             log.error("Failed to record inventory outbox send success | id: {} | error: {}",
@@ -136,6 +146,8 @@ public class InventoryOutboxRelay {
                 if (updated == 0) {
                     log.warn("Inventory outbox failure update skipped | id: {} | token: {}",
                             event.getId(), event.getClaimToken());
+                } else {
+                    metrics.outboxPublishFailure(event.getEventType(), nextStatus);
                 }
             });
         } catch (Exception ex) {

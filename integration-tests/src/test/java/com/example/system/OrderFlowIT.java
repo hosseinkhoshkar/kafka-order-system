@@ -17,7 +17,10 @@ import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.MethodOrderer;
+import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestMethodOrder;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.springframework.kafka.support.KafkaHeaders;
@@ -25,6 +28,7 @@ import org.testcontainers.kafka.ConfluentKafkaContainer;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.DockerClientFactory;
 import org.testcontainers.utility.DockerImageName;
 
 import java.nio.file.Files;
@@ -49,6 +53,7 @@ import static org.awaitility.Awaitility.await;
 
 /** Exercises packaged applications through HTTP, Kafka and independent databases. */
 @Testcontainers
+@TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class OrderFlowIT {
     @Container
     static final ConfluentKafkaContainer KAFKA = new ConfluentKafkaContainer(
@@ -144,6 +149,7 @@ class OrderFlowIT {
             "11, 20, CONFIRMED, INVENTORY_RESERVED, ORDER_CONFIRMED",
             "21, 20, CANCELLED, INVENTORY_RESERVATION_FAILED, ORDER_CANCELLED"
     })
+    @Order(10)
     void orderTraversesOutboxKafkaInventoryAndReply(int quantity, int initialStock, String status,
                                                    String inventoryEvent, String orderEvent) throws Exception {
         String product = "product-" + UUID.randomUUID();
@@ -204,6 +210,7 @@ class OrderFlowIT {
     }
 
     @Test
+    @Order(20)
     void malformedOrderJsonIsPublishedToDltWithOriginalBytesAndPartitionContinues() throws Exception {
         String badKey = "bad-" + UUID.randomUUID();
         byte[] badPayload = "{not-json".getBytes(java.nio.charset.StandardCharsets.UTF_8);
@@ -235,6 +242,97 @@ class OrderFlowIT {
                         orderId, "INVENTORY_RESERVED")).isEqualTo("1"));
     }
 
+    @Test
+    @Order(30)
+    void idempotencyKeyReplaysSameOrderAndRejectsConflictingRequest() throws Exception {
+        String product = "product-" + UUID.randomUUID();
+        execute(INVENTORY_DB, """
+                insert into inventory(product_id, available_quantity, reserved_quantity)
+                values (?, 5, 0)
+                """, product);
+        String idempotencyKey = "demo-key-" + UUID.randomUUID();
+        String body = JSON.writeValueAsString(Map.of("productId", product,
+                "customerId", "customer-test", "quantity", 2, "price", new BigDecimal("12.50")));
+
+        HttpResponse<String> first = postOrder(body, idempotencyKey);
+        HttpResponse<String> replay = postOrder(body, idempotencyKey);
+        String conflictingBody = JSON.writeValueAsString(Map.of("productId", product,
+                "customerId", "customer-test", "quantity", 3, "price", new BigDecimal("12.50")));
+        HttpResponse<String> conflict = postOrder(conflictingBody, idempotencyKey);
+
+        assertThat(first.statusCode()).as(first.body()).isEqualTo(201);
+        assertThat(replay.statusCode()).as(replay.body()).isEqualTo(201);
+        assertThat(replay.headers().firstValue("Idempotent-Replay")).contains("true");
+        assertThat(conflict.statusCode()).as(conflict.body()).isEqualTo(409);
+        JsonNode firstOrder = JSON.readTree(first.body());
+        JsonNode replayedOrder = JSON.readTree(replay.body());
+        assertThat(replayedOrder.path("orderId").asText()).isEqualTo(firstOrder.path("orderId").asText());
+        assertThat(scalar(ORDER_DB, "select count(*) from orders where order_id = ?",
+                firstOrder.path("orderId").asText())).isEqualTo("1");
+    }
+
+    @Test
+    @Order(40)
+    void actuatorHealthAndPrometheusExposeConfiguredObservability() throws Exception {
+        HttpResponse<String> liveness = HTTP.send(HttpRequest.newBuilder(
+                        URI.create("http://localhost:" + orderPort + "/actuator/health/liveness"))
+                .timeout(Duration.ofSeconds(5)).GET().build(), HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> readiness = HTTP.send(HttpRequest.newBuilder(
+                        URI.create("http://localhost:" + orderPort + "/actuator/health/readiness"))
+                .timeout(Duration.ofSeconds(5)).GET().build(), HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> prometheus = HTTP.send(HttpRequest.newBuilder(
+                        URI.create("http://localhost:" + orderPort + "/actuator/prometheus"))
+                .timeout(Duration.ofSeconds(5)).GET().build(), HttpResponse.BodyHandlers.ofString());
+
+        assertThat(liveness.statusCode()).isEqualTo(200);
+        assertThat(liveness.body()).contains("\"status\":\"UP\"");
+        assertThat(readiness.statusCode()).isEqualTo(200);
+        assertThat(readiness.body()).contains("\"status\":\"UP\"");
+        assertThat(prometheus.statusCode()).isEqualTo(200);
+        assertThat(prometheus.body()).contains("http_server_requests_seconds");
+        assertThat(prometheus.body()).contains("order_outbox_events");
+    }
+
+    @Test
+    @Order(100)
+    void kafkaOutageKeepsAcceptedOrderAndOutboxThenRecoversAfterBrokerReturns() throws Exception {
+        String product = "product-" + UUID.randomUUID();
+        execute(INVENTORY_DB, """
+                insert into inventory(product_id, available_quantity, reserved_quantity)
+                values (?, 5, 0)
+                """, product);
+        String body = JSON.writeValueAsString(Map.of("productId", product,
+                "customerId", "customer-test", "quantity", 1, "price", new BigDecimal("12.50")));
+
+        DockerClientFactory.instance().client().pauseContainerCmd(KAFKA.getContainerId()).exec();
+        String orderId;
+        try {
+            HttpResponse<String> response = postOrder(body, "kafka-down-" + UUID.randomUUID());
+            assertThat(response.statusCode()).as(response.body()).isEqualTo(201);
+            JsonNode order = JSON.readTree(response.body());
+            orderId = order.path("orderId").asText();
+            assertThat(scalar(ORDER_DB, "select status from orders where order_id = ?", orderId))
+                    .isEqualTo("PENDING");
+            assertThat(scalar(ORDER_DB, "select count(*) from outbox_events where aggregate_id = ?", orderId))
+                    .isEqualTo("1");
+        } finally {
+            DockerClientFactory.instance().client().unpauseContainerCmd(KAFKA.getContainerId()).exec();
+        }
+
+        await().alias("Order " + orderId + " recovers after Kafka returns; see " + LOGS)
+                .atMost(Duration.ofSeconds(90))
+                .pollInterval(Duration.ofMillis(500))
+                .untilAsserted(() -> {
+                    HttpResponse<String> fetched = HTTP.send(HttpRequest.newBuilder(
+                                    URI.create("http://localhost:" + orderPort + "/api/orders/" + orderId))
+                            .timeout(Duration.ofSeconds(5)).GET().build(), HttpResponse.BodyHandlers.ofString());
+                    assertThat(fetched.statusCode()).isEqualTo(200);
+                    assertThat(JSON.readTree(fetched.body()).path("status").asText()).isEqualTo("CONFIRMED");
+                    assertThat(scalar(ORDER_DB,
+                            "select status from outbox_events where aggregate_id = ?", orderId)).isEqualTo("SENT");
+                });
+    }
+
     private static String scalar(PostgreSQLContainer<?> database, String sql, String... parameters) throws Exception {
         try (var connection = DriverManager.getConnection(database.getJdbcUrl(),
                 database.getUsername(), database.getPassword());
@@ -264,6 +362,16 @@ class OrderFlowIT {
         try (KafkaProducer<String, byte[]> producer = new KafkaProducer<>(properties)) {
             producer.send(new ProducerRecord<>(topic, key, payload)).get(30, TimeUnit.SECONDS);
         }
+    }
+
+    private static HttpResponse<String> postOrder(String body, String idempotencyKey) throws Exception {
+        return HTTP.send(HttpRequest.newBuilder(URI.create("http://localhost:" + orderPort + "/api/orders"))
+                        .timeout(Duration.ofSeconds(15))
+                        .header("Content-Type", "application/json")
+                        .header("Idempotency-Key", idempotencyKey)
+                        .POST(HttpRequest.BodyPublishers.ofString(body))
+                        .build(),
+                HttpResponse.BodyHandlers.ofString());
     }
 
     private static ConsumerRecord<String, byte[]> readRecordByKey(String topic, String key, Duration timeout) {

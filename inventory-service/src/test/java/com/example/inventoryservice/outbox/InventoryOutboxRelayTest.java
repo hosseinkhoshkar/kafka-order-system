@@ -4,6 +4,7 @@ import com.example.common.event.EventEnvelope;
 import com.example.common.event.EventTypes;
 import com.example.common.event.InventoryReservedEvent;
 import com.example.inventoryservice.entity.InventoryOutboxEvent;
+import com.example.inventoryservice.observability.InventoryObservabilityMetrics;
 import com.example.inventoryservice.repository.InventoryOutboxEventRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
@@ -41,6 +42,8 @@ class InventoryOutboxRelayTest {
     private KafkaOperations<String, Object> kafkaTemplate;
     @Mock
     private PlatformTransactionManager transactionManager;
+    @Mock
+    private InventoryObservabilityMetrics metrics;
 
     private InventoryOutboxRelay relay;
     private final ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
@@ -50,7 +53,7 @@ class InventoryOutboxRelayTest {
     void setUp() {
         when(transactionManager.getTransaction(any(TransactionDefinition.class)))
                 .thenReturn(new SimpleTransactionStatus());
-        relay = new InventoryOutboxRelay(outboxEventRepository, objectMapper, clock, transactionManager, kafkaTemplate);
+        relay = new InventoryOutboxRelay(outboxEventRepository, objectMapper, clock, transactionManager, kafkaTemplate, metrics);
         ReflectionTestUtils.setField(relay, "inventoryReplyTopic", "inventory-reply");
         ReflectionTestUtils.setField(relay, "maxAttempts", 5);
         ReflectionTestUtils.setField(relay, "initialBackoff", java.time.Duration.ofSeconds(2));

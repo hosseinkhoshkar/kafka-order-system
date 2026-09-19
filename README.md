@@ -1,232 +1,294 @@
 # Kafka Order System
 
-Java 17 / Spring Boot demo of an asynchronous order workflow with Kafka and PostgreSQL.
-Inventory is reserved from persisted stock in `inventorydb`. Kafka delivery is treated as
-at-least-once: duplicate order events are ignored by inventory Inbox and per-order decision
-records, and inventory replies are published through a recoverable Inventory Outbox. Kafka
-consumer failures use bounded retry, Dead Letter Topics and a controlled single-record replay
-tool. This baseline does not claim production readiness or exactly-once delivery.
+Asynchronous order and inventory reservation demo built with Java 17, Spring Boot,
+Kafka and PostgreSQL. The project shows how to accept an order through HTTP,
+persist it safely, publish it through an Outbox, reserve real inventory in a
+separate database, and finalize the order from an asynchronous inventory reply.
 
-## Modules and flow
+This is a portfolio/demo system, not a production platform. It does not include
+Payment, a separate Saga orchestrator service, public deployment, Avro/schema
+registry, or exactly-once guarantees.
 
-- `common`: shared JSON event envelopes and payloads.
-- `order-service`: HTTP API, order database, event history, scheduled outbox relay and reply consumer.
-- `inventory-service`: order consumer, persisted inventory reservation, Inbox, decision log,
-  event history and scheduled reply outbox relay.
-- `kafka-replay-tool`: CLI-only operator tool for dry-run inspection and explicit replay of
-  one DLT record by topic, partition and offset.
-- `integration-tests`: test-only module; launches both packaged applications with isolated infrastructure.
+## Stack and Modules
 
-```text
-POST /api/orders -> orderdb (order + history + outbox)
-  -> scheduled relay -> orders topic -> inventory-service
-  -> inventorydb (Inbox + decision + stock + history + reply outbox)
-  -> scheduled relay -> inventory-reply topic
-  -> order-service -> orderdb (CONFIRMED or CANCELLED + history)
+- `common`: shared JSON event envelope and payload contracts.
+- `order-service`: REST API, order persistence, HTTP idempotency, order Inbox,
+  event history, order Outbox relay, inventory reply consumer.
+- `inventory-service`: order event consumer, real stock reservation, inventory
+  Inbox, decision table, event history, inventory reply Outbox relay.
+- `kafka-replay-tool`: CLI tool for controlled single-record DLT replay.
+- `integration-tests`: Testcontainers suite that runs packaged service jars
+  against temporary Kafka and PostgreSQL instances.
+
+Core technologies: Java 17, Spring Boot 3.2.5, Spring Web, Spring Data JPA,
+Spring Kafka, Flyway, PostgreSQL, Micrometer, Actuator, Testcontainers, Docker
+Compose.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    Client[HTTP client] --> OrderApi[order-service API]
+    OrderApi --> OrderDb[(orderdb)]
+    OrderDb --> OrderOutbox[order outbox relay]
+    OrderOutbox --> OrdersTopic[(Kafka orders)]
+    OrdersTopic --> InventoryConsumer[inventory-service consumer]
+    InventoryConsumer --> InventoryDb[(inventorydb)]
+    InventoryDb --> InventoryOutbox[inventory outbox relay]
+    InventoryOutbox --> ReplyTopic[(Kafka inventory-reply)]
+    ReplyTopic --> ReplyConsumer[order-service reply consumer]
+    ReplyConsumer --> OrderDb
+    OrdersTopic --> OrdersDlt[(orders.DLT)]
+    ReplyTopic --> ReplyDlt[(inventory-reply.DLT)]
 ```
 
-The HTTP response is `201 Created` with `PENDING` and a `Location: /api/orders/{orderId}`
-header. The order resource is persisted before responding; inventory confirmation remains
-asynchronous. Poll `GET /api/orders/{orderId}` for the final status.
+`orderdb` is owned by `order-service`; `inventorydb` is owned by
+`inventory-service`. Neither service writes the other service's database.
 
-## Prerequisites
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant O as order-service
+    participant ODB as orderdb
+    participant K as Kafka
+    participant I as inventory-service
+    participant IDB as inventorydb
 
-- JDK 17 (`JAVA_HOME` pointing to the JDK).
-- Docker Engine, or Docker Desktop running Linux containers.
-- Internet access for Maven dependencies and container images on the first run.
-- Run commands from the repository root. Maven installation is not required.
+    C->>O: POST /api/orders
+    O->>ODB: transaction: order PENDING + event_store + outbox + idempotency response
+    O-->>C: 201 PENDING + Location
+    O->>K: scheduled Outbox publishes ORDER_CREATED
+    K->>I: ORDER_CREATED
+    I->>IDB: transaction: Inbox + decision + stock update + event_store + reply outbox
+    I->>K: scheduled Outbox publishes INVENTORY_RESERVED or INVENTORY_RESERVATION_FAILED
+    K->>O: inventory reply
+    O->>ODB: transaction: Inbox + valid status transition + event_store
+    C->>O: GET /api/orders/{orderId}
+    O-->>C: CONFIRMED or CANCELLED
+```
 
-## Automated verification
+## Consistency Model
 
-Unit tests and test compilation (Docker not required):
+The system uses local ACID transactions plus Outbox/Inbox, not distributed
+transactions. Order creation commits before Kafka publication. If Kafka is down,
+the order and `PENDING` outbox row remain durable and the relay retries later.
+
+Kafka delivery is treated as at-least-once:
+
+- Consumers use Inbox tables keyed by `eventId`.
+- Duplicate messages with the same payload are ignored.
+- Duplicate `eventId` with different content is rejected and can go to DLT.
+- Inventory also has a per-order decision table to prevent re-reserving stock.
+- Order status transitions only allow `PENDING -> CONFIRMED` or
+  `PENDING -> CANCELLED`; duplicate matching final replies are harmless and
+  conflicting final replies fail.
+
+HTTP idempotency is separate from Kafka deduplication. `Idempotency-Key` on
+`POST /api/orders` replays the stored response for the same request fingerprint.
+Reusing the key with different order content returns `409 Conflict`. The raw key
+is persisted as the idempotency identifier but is not logged.
+
+## Failure Handling
+
+Outbox relays claim bounded batches with a lease, publish with stable aggregate
+keys, and mark rows `SENT` only when Kafka acknowledges. Failed sends return to
+`PENDING` with exponential backoff until `max-attempts`, then become `FAILED`.
+Expired `IN_PROGRESS` claims can be reclaimed after the lease. Callback updates
+match the claim token so an old callback cannot overwrite a newer claim.
+
+Kafka consumers use bounded retry and Dead Letter Topics:
+
+| Source topic | Consumer group | DLT |
+| --- | --- | --- |
+| `orders` | `inventory-group` | `orders.DLT` |
+| `inventory-reply` | `order-group` | `inventory-reply.DLT` |
+
+Malformed JSON, unsupported schema versions, invalid payloads and domain
+conflicts are non-retryable. Temporary listener failures are retried before DLT.
+The replay tool reads one DLT record by topic/partition/offset and republishes
+only when `--execute` is supplied. It does not delete DLT records or claim
+exactly-once replay.
+
+## Observability
+
+Actuator endpoints exposed by both services:
+
+- `/actuator/health`
+- `/actuator/health/liveness`
+- `/actuator/health/readiness`
+- `/actuator/metrics`
+- `/actuator/prometheus`
+
+Sensitive Actuator endpoints such as `env`, `configprops` and `heapdump` are not
+exposed.
+
+Readiness policy:
+
+- `order-service`: readiness includes application readiness and database health.
+  Kafka is intentionally not a readiness dependency for accepting orders because
+  the order Outbox stores work durably while Kafka is unavailable.
+- `inventory-service`: readiness includes application readiness, database health
+  and Kafka health because its primary role is Kafka consumption.
+- Liveness only reflects the running application state, not Kafka or database
+  availability.
+
+Custom Micrometer metrics:
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `order_orders_created_total` | counter | none | Orders created after transaction commit. |
+| `order_status_transitions_total` | counter | `from`, `to` | Committed order status transitions. |
+| `inventory_reservations_total` | counter | `result` | Committed inventory reservation decisions. |
+| `order_inbox_duplicates_total` | counter | `event_type` | Duplicate inventory replies detected by order Inbox. |
+| `inventory_inbox_duplicates_total` | counter | `event_type` | Duplicate order events detected by inventory Inbox. |
+| `order_http_idempotency_replays_total` | counter | none | HTTP idempotency replay responses. |
+| `order_http_idempotency_conflicts_total` | counter | none | HTTP idempotency conflicts. |
+| `*_outbox_publish_attempts_total` | counter | `event_type` | Outbox Kafka send attempts. |
+| `*_outbox_publish_success_total` | counter | `event_type` | Outbox rows marked `SENT`. |
+| `*_outbox_publish_failures_total` | counter | `event_type`, `outcome` | Outbox publish failures recorded as `PENDING` or `FAILED`. |
+| `*_outbox_events` | gauge | `status` | Cached count of Outbox rows by status. |
+| `*_outbox_oldest_unpublished_age_seconds` | gauge | none | Cached age of oldest non-`SENT` Outbox row, `0` when none exists. |
+| `*_kafka_dlt_publish_total` | counter | `topic`, `result` | DLT producer callback result for DLT topics. |
+| `*_kafka_dlt_observed_total` | counter | `topic` | DLT listener observed a DLT record. |
+
+Metrics are process-local observations, not an audit ledger. Counters reset on
+restart. Some counters are emitted after commit; a crash between commit and
+metric publication can still lose a metric increment. Outbox gauges are refreshed
+from bounded aggregate SQL on a schedule instead of querying on every scrape.
+
+Logs include MDC fields `orderId`, `eventId` and `correlationId` on order
+creation, Kafka listeners, inventory decisions, Outbox publication callbacks and
+order finalization. Full payloads, credentials and raw `Idempotency-Key` values
+are not logged intentionally.
+
+## Optional Monitoring
+
+The main development Compose file does not start monitoring. To start Prometheus
+and Grafana for a local demo on Windows/Docker Desktop:
 
 ```powershell
-.\order-service\mvnw.cmd -B -ntp -f pom.xml test
+docker compose -f docker-compose.yml -f docker-compose.monitoring.yml --profile monitoring up -d
 ```
 
-Full build, unit tests and integration tests (Docker required):
+Prometheus: http://localhost:9090  
+Grafana: http://localhost:3000
+
+The Grafana admin user/password in `docker-compose.monitoring.yml` is
+`admin/admin` and is development-only. Prometheus scrapes
+`host.docker.internal:8081` and `host.docker.internal:8082`, so start both Java
+services on their default host ports before expecting data. Alert rules are
+examples only; without Alertmanager they do not send notifications.
+
+## Run Locally
+
+Prerequisites:
+
+- JDK 17. Set `JAVA_HOME` to a JDK 17 installation.
+- Docker Engine or Docker Desktop with Linux containers.
+- Internet access for Maven dependencies and container images on first run.
+- Run commands from the repository root. Use the Maven wrapper in
+  `order-service`.
+
+Start infrastructure:
 
 ```powershell
-docker info
-.\order-service\mvnw.cmd -B -ntp -f pom.xml clean verify
-```
-
-Linux/macOS equivalents:
-
-```sh
-bash order-service/mvnw -B -ntp -f pom.xml test
-bash order-service/mvnw -B -ntp -f pom.xml clean verify
-```
-
-`verify` uses Testcontainers 1.21.4 (pinned for compatibility with recent Docker Engines)
-to create one Kafka broker and two PostgreSQL databases on
-random host ports. It does not use the databases or Kafka from `docker-compose.yml`.
-Both executable service jars run as separate Java processes with random HTTP ports.
-Processes and test containers are stopped after the suite. Docker absence fails the suite;
-integration tests are not silently skipped. Always run the full root reactor so service jars
-are packaged before the test module runs.
-
-The integration suite checks:
-
-- Both real Spring applications start and the Order health endpoint responds.
-- Quantity `2` with enough seeded stock: HTTP `PENDING` eventually becomes database `CONFIRMED`.
-- Quantity `11` with stock `20`: confirms, proving the old `quantity > 10` rule is gone.
-- Quantity above available stock: HTTP `PENDING` eventually becomes database `CANCELLED`.
-- Outbox reaches `SENT`; Order creation/final history and Inventory result are persisted.
-- The inventory reply preserves the order correlation ID and product ID.
-- GET-by-ID returns the final status and preserves the exact decimal price in PostgreSQL.
-- Malformed Kafka JSON reaches the configured DLT with its original bytes and a following
-  valid record from the same topic can still be consumed.
-- The replay tool dry-run does not publish, and `--execute` republishes only the selected
-  DLT record to a configured destination while preserving key and payload bytes.
-
-Order MVC tests also cover invalid inputs, malformed JSON, fractional quantities, 404,
-error response privacy, the Location header and exact decimal deserialization.
-
-Inventory service tests also exercise duplicate delivery, concurrent duplicate delivery,
-same-order redelivery, same-order conflict handling, failed-decision stability, concurrent
-stock reservation without overselling, transaction rollback, outbox retry and expired-claim
-recovery against PostgreSQL/Testcontainers. Invalid input is covered by MVC tests.
-
-Reports: each module's `target/surefire-reports`, plus
-`integration-tests/target/failsafe-reports`. Application logs:
-`integration-tests/target/application-logs`. CI runs `clean verify` on Java 17 and uploads
-these files even when tests fail.
-
-## Run the local demo
-
-Start infrastructure; wait for the readiness checks below before starting applications:
-
-```sh
 docker compose up -d
 docker compose exec -T postgres-order pg_isready -U admin -d orderdb
 docker compose exec -T postgres-inventory pg_isready -U admin -d inventorydb
 docker compose exec -T kafka kafka-topics --bootstrap-server kafka:29092 --list
 ```
 
-If a check fails during startup, inspect `docker compose logs <service>` and retry the check.
-For predictable demo topic creation, run once the broker is ready:
+Create demo topics:
 
-```sh
+```powershell
 docker compose exec -T kafka kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic orders --partitions 1 --replication-factor 1
 docker compose exec -T kafka kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic inventory-reply --partitions 1 --replication-factor 1
 docker compose exec -T kafka kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic orders.DLT --partitions 1 --replication-factor 1
 docker compose exec -T kafka kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic inventory-reply.DLT --partitions 1 --replication-factor 1
 ```
 
-Build the jars with unit tests (the full verification command above also builds them):
+Build packaged services:
 
 ```powershell
+$env:JAVA_HOME='C:\Users\Hossein\.jdks\corretto-17.0.14'
+$env:Path="$env:JAVA_HOME\bin;$env:Path"
 .\order-service\mvnw.cmd -B -ntp -f pom.xml package
 ```
 
-Start each application in a separate terminal:
+Start applications in separate terminals:
 
-```sh
+```powershell
 java -jar inventory-service/target/inventory-service-0.0.1-SNAPSHOT.jar
 java -jar order-service/target/order-service-0.0.1-SNAPSHOT.jar
 ```
 
-Services: Order `8081`, Inventory `8082`, Kafka `9092`, Kafka UI `8080`,
-Order PostgreSQL `5432`, Inventory PostgreSQL `5433`, pgAdmin `5050`.
-The Compose credentials are local-demo defaults. Do not expose this setup publicly.
+Default local ports: Order `8081`, Inventory `8082`, Kafka `9092`, Kafka UI
+`8080`, Order PostgreSQL `5432`, Inventory PostgreSQL `5433`, pgAdmin `5050`.
+The Compose credentials are local-demo defaults. Do not expose this setup
+publicly.
 
-Seed demo inventory explicitly before creating orders. Production startup does not insert
-stock automatically:
+Seed demo stock explicitly:
 
-```sh
+```powershell
 docker compose exec -T postgres-inventory psql -U admin -d inventorydb -c "insert into inventory(product_id, available_quantity, reserved_quantity) values ('product-1', 20, 0) on conflict (product_id) do update set available_quantity = excluded.available_quantity, reserved_quantity = excluded.reserved_quantity;"
 ```
 
-Create a successful order in PowerShell:
+Create an order:
 
 ```powershell
 $body = @{ productId='product-1'; customerId='customer-1'; quantity=2; price=12.50 } | ConvertTo-Json
-$order = Invoke-RestMethod -Method Post -Uri 'http://localhost:8081/api/orders' -ContentType 'application/json' -Body $body
+$headers = @{ 'Idempotency-Key' = "demo-order-$(Get-Date -Format yyyyMMddHHmmss)" }
+$order = Invoke-RestMethod -Method Post -Uri 'http://localhost:8081/api/orders' -Headers $headers -ContentType 'application/json' -Body $body
 $order
-```
-
-Repeat with `quantity=11`; with the stock seed above it succeeds. Use a quantity above
-available stock, or an unseeded product, to exercise business rejection. Bash equivalent:
-
-```sh
-curl -H 'Content-Type: application/json' -d '{"productId":"product-1","customerId":"customer-1","quantity":2,"price":12.50}' http://localhost:8081/api/orders
-```
-
-Poll the order in PowerShell (using the response from the POST example):
-
-```powershell
 Invoke-RestMethod -Uri "http://localhost:8081/api/orders/$($order.orderId)"
 ```
 
-Allow at least one relay cycle (five seconds). You can also inspect database history:
-
-```sh
-docker compose exec -T postgres-order psql -U admin -d orderdb -c "select order_id, quantity, status from orders order by created_at desc limit 10;"
-docker compose exec -T postgres-order psql -U admin -d orderdb -c "select aggregate_id, status from outbox_events order by created_at desc limit 10;"
-docker compose exec -T postgres-inventory psql -U admin -d inventorydb -c "select product_id, available_quantity, reserved_quantity from inventory order by product_id;"
-docker compose exec -T postgres-inventory psql -U admin -d inventorydb -c "select order_id, product_id, quantity, status from inventory_reservation_decisions order by decided_at desc limit 10;"
-docker compose exec -T postgres-inventory psql -U admin -d inventorydb -c "select aggregate_id, event_type, status from inventory_outbox_events order by created_at desc limit 10;"
-```
-
-Stop the Java processes with Ctrl+C, then run `docker compose down`. This preserves the
-PostgreSQL volumes. Kafka has no persistent volume in the current Compose configuration.
-Integration tests always start with fresh, separate databases; no local volume deletion is needed.
-
-## Kafka failure handling and replay runbook
-
-### Error policy
-
-| Failure | Consumer behavior |
-| --- | --- |
-| Temporary infrastructure failure, for example transient database or broker access during listener processing | Retry with fixed backoff, then DLT after `kafka.consumer.error.max-attempts` total delivery attempts. |
-| Malformed JSON or deserialization failure before the listener | No business retry. The original raw bytes are sent to DLT through `ErrorHandlingDeserializer` and `DeadLetterPublishingRecoverer`. |
-| Valid envelope with unsupported `schemaVersion`, missing required envelope/payload fields, invalid quantity or type mismatch | Non-retryable contract error; send to DLT. Unknown optional fields remain compatible. |
-| Duplicate `eventId` with different payload hash or same order with conflicting product/quantity | Non-retryable permanent conflict; send to DLT. |
-| Insufficient or missing inventory | Normal business result. Inventory emits `INVENTORY_RESERVATION_FAILED`; it is not a DLT condition. |
-| Inventory reply for a missing order | Limited retry, then `inventory-reply.DLT`. In the normal outbox flow the order row is committed before `ORDER_CREATED` is published, so a persistent missing order indicates data corruption, restore lag, or an out-of-band message. |
-| Unexpected null/tombstone value on application topics | Treated as an invalid message and sent to DLT without a listener null pointer loop. |
-
-Config:
-
-```yaml
-kafka.consumer.error.max-attempts: 3
-kafka.consumer.error.backoff-ms: 1000
-kafka.consumer.error.dlt-send-timeout: PT10S
-```
-
-`max-attempts` is the initial listener call plus retries. The Spring Kafka error handler
-pauses/sleeps the listener thread for blocking retry, so large backoff values delay later
-records in the same partition and must remain comfortably below `max.poll.interval.ms`.
-
-### Topics and DLTs
-
-| Source topic | Consumer group | DLT | Partition rule |
-| --- | --- | --- | --- |
-| `orders` | `inventory-group` | `orders.DLT` | Same partition as the failed source record. |
-| `inventory-reply` | `order-group` | `inventory-reply.DLT` | Same partition as the failed source record. |
-
-Create DLTs with at least the same partition count as their source topics. Configure retention
-long enough for investigation and audit; for the local demo, create them manually with the
-commands above. DLT publication keeps the original key and payload. Spring Kafka DLT headers
-record original topic, partition, offset, consumer group and sanitized exception information;
-stack traces are excluded from DLT headers to avoid leaking sensitive details and unbounded
-header growth.
-
-The simple DLT listeners only log that a DLT record exists. They are not a management UI and
-they do not replay records automatically.
-
-### Replay one DLT record
-
-Build the tool:
+Useful inspection queries:
 
 ```powershell
-$env:JAVA_HOME='C:\path\to\jdk17'
+docker compose exec -T postgres-order psql -U admin -d orderdb -c "select order_id, quantity, status from orders order by created_at desc limit 10;"
+docker compose exec -T postgres-order psql -U admin -d orderdb -c "select aggregate_id, status, attempt_count, last_error from outbox_events order by created_at desc limit 10;"
+docker compose exec -T postgres-inventory psql -U admin -d inventorydb -c "select product_id, available_quantity, reserved_quantity from inventory order by product_id;"
+docker compose exec -T postgres-inventory psql -U admin -d inventorydb -c "select order_id, product_id, quantity, status from inventory_reservation_decisions order by decided_at desc limit 10;"
+docker compose exec -T postgres-inventory psql -U admin -d inventorydb -c "select aggregate_id, event_type, status, attempt_count, last_error from inventory_outbox_events order by created_at desc limit 10;"
+```
+
+Stop Java processes with Ctrl+C. `docker compose down` preserves PostgreSQL
+volumes. Use `docker compose down -v` only when you intentionally want to delete
+local demo data.
+
+## Tests and CI
+
+Fast unit and service tests:
+
+```powershell
+$env:JAVA_HOME='C:\Users\Hossein\.jdks\corretto-17.0.14'
 $env:Path="$env:JAVA_HOME\bin;$env:Path"
+.\order-service\mvnw.cmd -B -ntp -f pom.xml test
+```
+
+Full verification with Testcontainers:
+
+```powershell
+docker info
+.\order-service\mvnw.cmd -B -ntp -f pom.xml clean verify
+```
+
+`clean verify` runs unit tests plus integration tests that start temporary Kafka
+and PostgreSQL containers. It does not use your Compose databases or broker.
+Application logs from integration tests are written to
+`integration-tests/target/application-logs`. CI runs the same `clean verify` on
+Java 17 and uploads Surefire/Failsafe reports and application logs.
+
+## Replay Tool
+
+Build:
+
+```powershell
 .\order-service\mvnw.cmd -B -ntp -f pom.xml -pl kafka-replay-tool -am package
 ```
 
-Dry-run is the default and does not commit offsets or publish:
+Dry run:
 
 ```powershell
 java -jar .\kafka-replay-tool\target\kafka-replay-tool.jar `
@@ -236,7 +298,7 @@ java -jar .\kafka-replay-tool\target\kafka-replay-tool.jar `
   --offset 42
 ```
 
-Execute requires an explicit flag:
+Execute explicitly:
 
 ```powershell
 java -jar .\kafka-replay-tool\target\kafka-replay-tool.jar `
@@ -247,152 +309,36 @@ java -jar .\kafka-replay-tool\target\kafka-replay-tool.jar `
   --execute
 ```
 
-Trusted destinations live in `ops/replay.properties`:
+Allowed destinations are configured in `ops/replay.properties`.
 
-```properties
-replay.destination.orders.DLT=orders
-replay.destination.inventory-reply.DLT=inventory-reply
-```
+## Portfolio Summary
 
-The DLT record header is never allowed to choose an arbitrary destination. Replay uses its own
-temporary consumer group, `assign/seek`, does not commit application offsets and does not delete
-the DLT record. It preserves key, payload bytes, `eventId` and `correlationId`; it removes Kafka
-error/retry control headers and adds `x-replay-*` audit headers. Repeated `--execute` can publish
-duplicates, so business safety depends on Inbox and domain idempotency. A timeout after send means
-the result is unknown; the tool does not provide exactly-once replay guarantees.
+Interview explanation:
 
-Replay is appropriate after the root cause has been corrected, for example a temporary database
-outage or a fixed consumer bug. Replaying malformed JSON or an unsupported schema version without
-fixing the payload or consumer support only sends the same bad message through the same failure path.
+> This project demonstrates an at-least-once, event-driven order flow. The API
+> commits orders and Outbox rows in one local transaction, relays events to
+> Kafka, reserves real inventory in a separate service/database, and finalizes
+> orders from inventory replies. Duplicate HTTP requests are handled by HTTP
+> idempotency; duplicate Kafka messages are handled by Inbox tables and domain
+> idempotency. Failures are observable through Actuator health, Prometheus
+> metrics, structured correlation logs, DLTs and a controlled replay tool.
 
-### Kafka DLT vs Outbox FAILED
+Resume bullets:
 
-Kafka DLT records are failed consumed messages. They preserve broker source metadata and are
-replayed with the CLI above. Outbox `FAILED` rows are failed publications from a service database
-to Kafka; their recovery path is database/operator controlled: inspect `last_error` and the stable
-outbox payload, fix the cause, then intentionally move the row back to `PENDING` or compensate.
-Do not treat an outbox row as a Kafka DLT record.
+- Built a Java 17/Spring Boot order workflow using Kafka, PostgreSQL, Flyway,
+  Outbox/Inbox, DLT replay tooling and Testcontainers-based recovery tests.
+- Implemented real inventory reservation with database-backed idempotency to
+  prevent duplicate message effects and overselling under concurrent requests.
+- Added Actuator/Micrometer observability with readiness policy, Prometheus
+  metrics, Grafana provisioning and correlation-aware logs.
 
-## Current limitations
+## Current Limitations
 
-Inventory reservation is real and guarded by an atomic conditional PostgreSQL update.
-Inventory Inbox deduplicates by `eventId`; a duplicate `eventId` with different content is
-treated as an invalid message and sent through the configured Kafka error handler/DLT path.
-Per-order decisions prevent re-deciding the same order: a new event with the same `orderId`,
-`productId` and `quantity` keeps the existing decision, while a different product or
-quantity is treated as a conflict and no ordinary inventory reply is emitted.
-
-Inventory replies are stored in `inventory_outbox_events` before publication. The relay uses
-bounded batches, claim tokens, leases, exponential backoff and max attempts. Kafka key is the
-`orderId`; retry keeps the same reply `eventId`, payload and correlation ID. Expired
-`IN_PROGRESS` claims become claimable after the lease. `FAILED` outbox rows require an
-operator decision: inspect `last_error` and the stable `payload`; after correcting the cause,
-set `status='PENDING'`, clear claim fields, reset or adjust `attempt_count`, and set
-`next_attempt_at=now()` in a controlled maintenance window. No automatic replay API is
-provided in this stage.
-
-The `order-service` reply consumer now uses its Inbox and status transition service for duplicate
-inventory replies. The codebase contains the `order_idempotency_keys` schema/entity/repository,
-but the HTTP controller still does not enforce an `Idempotency-Key` header. That gap is not part
-of the Kafka DLT/replay path. Saga timeouts also remain future work. `event_store` is audit
-history, not a full event-sourced system. Flyway manages schema and Hibernate validates it.
-
-## Order API (stage 2)
-
-- `POST /api/orders`: `201 Created`, `Location` header and an order DTO.
-- `GET /api/orders/{orderId}`: `200` with the persisted status; `404` if absent.
-- `GET /api/orders/health`: unchanged basic liveness text.
-- Errors use `application/problem+json` with `type`, `title`, `status`, `detail` and `instance`.
-  Validation errors additionally contain an `errors` map keyed by field name.
-
-Both IDs must be nonblank and at most 255 characters. Quantity must be a positive integer
-within Java's Integer range; fractional quantities are rejected, not truncated.
-`price` is the positive **unit price in EUR**, with at most 17 integer digits and 2 fractional
-digits. This demo uses one implicit currency; the response includes `currency: "EUR"`.
-No currency conversion is performed, and total price is not calculated by this endpoint.
-Prices travel as JSON numbers and BigDecimal through request, entity, response and the
-existing OrderCreatedEvent. Clients should use decimal-aware JSON handling for money.
-
-Compatibility changes: POST previously returned 200 and now returns 201; invalid inputs
-previously accepted may now return 400. The response retains existing fields and adds
-currency and updatedAt. The Kafka envelope and event field structure remain unchanged.
-Confirm the EUR assumption for any pre-existing data; earlier versions did not define currency.
-
-## Database schema and migrations
-
-Both services use Flyway migrations from their own module:
-
-- `order-service/src/main/resources/db/migration`
-- `inventory-service/src/main/resources/db/migration`
-
-Normal application startup runs pending migrations first, then Hibernate validates the
-schema with `spring.jpa.hibernate.ddl-auto=validate`. A brand-new empty database is created
-from `V1__initial_schema.sql`; follow-up compatibility checks live in later migrations.
-Do not edit an applied migration. Add a new versioned migration instead.
-
-The migration index choices are intentionally narrow:
-
-- `outbox_events(status)`: supports the current relay query for pending outbox rows.
-- `event_store(aggregate_id, version)`: supports aggregate history reads ordered by version.
-- `inventory_inbox_events(event_id)`: prevents duplicate event processing.
-- `inventory_reservation_decisions(order_id)`: prevents re-deciding an order.
-- `inventory_outbox_events(status, next_attempt_at, created_at, id)` and
-  `(status, claimed_until, created_at, id)`: support relay claims and expired lease recovery.
-
-No unique constraint is placed on event version yet because the current version allocation is
-not concurrency-safe. `sent_at` remains nullable because pending and failed outbox rows have
-not necessarily been sent.
-
-### Empty local databases
-
-For a fresh local demo database, start Compose and then start both applications normally.
-Flyway will create the schema; Hibernate will validate it. If startup fails at validation,
-inspect the Flyway error before changing application code.
-
-### Existing database adoption
-
-`baseline-on-migrate` is deliberately not enabled in application configuration. To adopt an
-existing database that was previously managed by Hibernate `ddl-auto:update`, perform this
-manually and only after taking a backup.
-
-Minimum pre-checks for `orderdb`:
-
-```sql
-select count(*) from orders where
-  order_id is null or product_id is null or customer_id is null
-  or quantity is null or price is null or status is null
-  or created_at is null or updated_at is null;
-
-select count(*) from orders where quantity <= 0;
-select count(*) from orders where price <= 0;
-select count(*) from orders where price > 99999999999999999.99;
-select count(*) from orders where abs(price::numeric - round(price::numeric, 2)) > 0.0000001;
-select status, count(*) from orders group by status;
-```
-
-Minimum pre-checks for `inventorydb`:
-
-```sql
-select count(*) from inventory where
-  product_id is null or available_quantity is null or reserved_quantity is null;
-select count(*) from inventory where available_quantity < 0 or reserved_quantity < 0;
-```
-
-If the existing order `price` column is floating point, precision already lost by the old
-type cannot be recovered. The compatibility migration refuses null, non-positive,
-out-of-range and more-than-two-decimal-place prices rather than silently rounding business
-data. Resolve any returned rows explicitly before migration.
-
-Manual adoption outline:
-
-1. Stop both applications.
-2. Take a database-native backup, for example `pg_dump`, and verify it can be restored.
-3. Run the pre-check queries above and resolve any incompatible rows by an explicit
-   operational decision.
-4. Baseline each existing schema at version `1` using Flyway tooling or a one-off
-   maintenance command with the service's migration directory.
-5. Run Flyway migrate for that same service.
-6. Start the application and confirm Hibernate validation succeeds.
-
-Rollback is backup/restore. Do not treat conversion from `numeric(19,2)` back to floating
-point as a lossless rollback; it can lose decimal fidelity.
+- No Payment service, Saga orchestrator service, saga timeout scheduler or
+  compensation workflow.
+- No schema registry; event contracts are JSON DTOs with compatibility tests.
+- No public deployment, secrets management, authentication or TLS.
+- DLT replay is operator-driven and single-record only.
+- Outbox `FAILED` rows require operator inspection and a controlled reset or
+  compensation decision.
+- The local Compose environment is development-only.

@@ -4,6 +4,7 @@ import com.example.common.event.EventEnvelope;
 import com.example.common.event.EventTypes;
 import com.example.common.event.OrderCreatedEvent;
 import com.example.orderservice.entity.OutboxEvent;
+import com.example.orderservice.observability.OrderObservabilityMetrics;
 import com.example.orderservice.repository.OutboxEventRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
@@ -42,6 +43,8 @@ class OutboxRelayTest {
 
     @Mock
     private PlatformTransactionManager transactionManager;
+    @Mock
+    private OrderObservabilityMetrics metrics;
 
     private OutboxRelay outboxRelay;
     private final ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
@@ -51,7 +54,7 @@ class OutboxRelayTest {
     void setUp() {
         when(transactionManager.getTransaction(any(TransactionDefinition.class)))
                 .thenReturn(new SimpleTransactionStatus());
-        outboxRelay = new OutboxRelay(outboxEventRepository, objectMapper, clock, transactionManager, kafkaTemplate);
+        outboxRelay = new OutboxRelay(outboxEventRepository, objectMapper, clock, transactionManager, kafkaTemplate, metrics);
         ReflectionTestUtils.setField(outboxRelay, "ordersTopic", "orders");
         ReflectionTestUtils.setField(outboxRelay, "maxAttempts", 5);
         ReflectionTestUtils.setField(outboxRelay, "initialBackoff", java.time.Duration.ofSeconds(2));

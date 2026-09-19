@@ -2,11 +2,13 @@ package com.example.orderservice.outbox;
 
 import com.example.common.event.EventEnvelope;
 import com.example.orderservice.entity.OutboxEvent;
+import com.example.orderservice.observability.OrderObservabilityMetrics;
 import com.example.orderservice.repository.OutboxEventRepository;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.slf4j.MDC;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.kafka.core.KafkaOperations;
@@ -35,6 +37,7 @@ public class OutboxRelay {
     private final PlatformTransactionManager transactionManager;
     @Qualifier("objectKafkaTemplate")
     private final KafkaOperations<String, Object> kafkaTemplate;
+    private final OrderObservabilityMetrics metrics;
 
     @Value("${kafka.topic.orders}")
     private String ordersTopic;
@@ -93,6 +96,7 @@ public class OutboxRelay {
 
         CompletableFuture<?> sendFuture;
         try {
+            metrics.outboxPublishAttempt(event.getEventType());
             sendFuture = kafkaTemplate.send(ordersTopic, event.getAggregateId(), envelope);
         } catch (Exception ex) {
             recordFailure(event, "Kafka send failed before acknowledgement: " + ex.getMessage(), false);
@@ -100,10 +104,14 @@ public class OutboxRelay {
         }
 
         sendFuture.whenComplete((result, ex) -> {
-            if (ex == null) {
-                recordSuccess(event);
-            } else {
-                recordFailure(event, "Kafka send failed: " + ex.getMessage(), false);
+            try (MDC.MDCCloseable orderId = MDC.putCloseable("orderId", event.getAggregateId());
+                 MDC.MDCCloseable eventId = MDC.putCloseable("eventId", envelope.eventId());
+                 MDC.MDCCloseable correlationId = MDC.putCloseable("correlationId", envelope.correlationId())) {
+                if (ex == null) {
+                    recordSuccess(event);
+                } else {
+                    recordFailure(event, "Kafka send failed: " + ex.getMessage(), false);
+                }
             }
         });
     }
@@ -116,6 +124,7 @@ public class OutboxRelay {
             if (updated == null || updated == 0) {
                 log.warn("Outbox SENT update skipped | id: {} | token: {}", event.getId(), event.getClaimToken());
             } else {
+                metrics.outboxPublishSuccess(event.getEventType());
                 log.info("Outbox event sent | id: {} | type: {}", event.getId(), event.getEventType());
             }
         } catch (Exception ex) {
@@ -138,6 +147,8 @@ public class OutboxRelay {
                 );
                 if (updated == 0) {
                     log.warn("Outbox failure update skipped | id: {} | token: {}", event.getId(), event.getClaimToken());
+                } else {
+                    metrics.outboxPublishFailure(event.getEventType(), nextStatus);
                 }
             });
         } catch (Exception ex) {
