@@ -6,6 +6,7 @@ import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.clients.producer.RecordMetadata;
 import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.apache.kafka.common.serialization.StringSerializer;
+import org.springframework.boot.autoconfigure.kafka.KafkaProperties;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -22,6 +23,12 @@ import java.util.Map;
 @Configuration
 public class KafkaProducerConfig {
 
+    private final KafkaProperties kafkaProperties;
+
+    public KafkaProducerConfig(KafkaProperties kafkaProperties) {
+        this.kafkaProperties = kafkaProperties;
+    }
+
     @Value("${spring.kafka.bootstrap-servers}")
     private String bootstrapServers;
 
@@ -31,7 +38,7 @@ public class KafkaProducerConfig {
         delegates.put(byte[].class, new ByteArraySerializer());
         delegates.put(Object.class, new JsonSerializer<>());
 
-        Map<String, Object> config = new LinkedHashMap<>();
+        Map<String, Object> config = new LinkedHashMap<>(kafkaProperties.buildProducerProperties(null));
         config.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
         config.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
         config.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, DelegatingByTypeSerializer.class);

@@ -104,11 +104,23 @@ class OrderFlowIT {
                 "--spring.datasource.username=" + database.getUsername(),
                 "--spring.datasource.password=" + database.getPassword(),
                 "--spring.kafka.bootstrap-servers=" + KAFKA.getBootstrapServers(),
+                "--spring.kafka.producer.properties.max.block.ms=1000",
+                "--spring.kafka.producer.properties.request.timeout.ms=1000",
+                "--spring.kafka.producer.properties.delivery.timeout.ms=3000",
+                "--spring.kafka.producer.properties.retry.backoff.ms=100",
+                "--spring.kafka.producer.properties.reconnect.backoff.ms=100",
+                "--spring.kafka.producer.properties.reconnect.backoff.max.ms=500",
                 "--spring.jpa.hibernate.ddl-auto=validate",
                 "--spring.jpa.show-sql=false",
                 "--spring.main.banner-mode=off",
-                "--outbox.relay.poll-interval-ms=1000",
-                "--inventory.outbox.relay.poll-interval-ms=1000");
+                "--outbox.relay.poll-interval-ms=500",
+                "--outbox.relay.initial-backoff=PT1S",
+                "--outbox.relay.max-backoff=PT2S",
+                "--outbox.relay.max-attempts=10",
+                "--inventory.outbox.relay.poll-interval-ms=500",
+                "--inventory.outbox.relay.initial-backoff=PT1S",
+                "--inventory.outbox.relay.max-backoff=PT2S",
+                "--inventory.outbox.relay.max-attempts=10");
         APPLICATIONS.add(new ProcessBuilder(command).directory(ROOT.toFile())
                 .redirectErrorStream(true).redirectOutput(LOGS.resolve(service + ".log").toFile()).start());
     }
@@ -304,8 +316,9 @@ class OrderFlowIT {
         String body = JSON.writeValueAsString(Map.of("productId", product,
                 "customerId", "customer-test", "quantity", 1, "price", new BigDecimal("12.50")));
 
+        String orderId = null;
+        String orderCreatedEventId = null;
         DockerClientFactory.instance().client().pauseContainerCmd(KAFKA.getContainerId()).exec();
-        String orderId;
         try {
             HttpResponse<String> response = postOrder(body, "kafka-down-" + UUID.randomUUID());
             assertThat(response.statusCode()).as(response.body()).isEqualTo(201);
@@ -315,21 +328,62 @@ class OrderFlowIT {
                     .isEqualTo("PENDING");
             assertThat(scalar(ORDER_DB, "select count(*) from outbox_events where aggregate_id = ?", orderId))
                     .isEqualTo("1");
+            orderCreatedEventId = JSON.readTree(scalar(ORDER_DB,
+                    "select payload from outbox_events where aggregate_id = ?", orderId)).path("eventId").asText();
+
+            String createdOrderId = orderId;
+            await().alias("Outbox publish failure is recorded before Kafka returns; see " + LOGS)
+                    .atMost(Duration.ofSeconds(30))
+                    .pollInterval(Duration.ofMillis(250))
+                    .untilAsserted(() -> {
+                        assertThat(scalar(ORDER_DB,
+                                "select status from outbox_events where aggregate_id = ?", createdOrderId))
+                                .isEqualTo("PENDING");
+                        assertThat(Integer.parseInt(scalar(ORDER_DB,
+                                "select attempt_count from outbox_events where aggregate_id = ?", createdOrderId)))
+                                .isBetween(1, 9);
+                        assertThat(scalar(ORDER_DB,
+                                "select last_error from outbox_events where aggregate_id = ?", createdOrderId))
+                                .contains("Kafka send failed");
+                    });
         } finally {
             DockerClientFactory.instance().client().unpauseContainerCmd(KAFKA.getContainerId()).exec();
         }
 
-        await().alias("Order " + orderId + " recovers after Kafka returns; see " + LOGS)
+        assertThat(orderId).isNotBlank();
+        assertThat(orderCreatedEventId).isNotBlank();
+        String recoveredOrderId = orderId;
+        String recoveredEventId = orderCreatedEventId;
+
+        await().alias("Order " + recoveredOrderId + " recovers after Kafka returns; see " + LOGS)
                 .atMost(Duration.ofSeconds(90))
                 .pollInterval(Duration.ofMillis(500))
                 .untilAsserted(() -> {
                     HttpResponse<String> fetched = HTTP.send(HttpRequest.newBuilder(
-                                    URI.create("http://localhost:" + orderPort + "/api/orders/" + orderId))
+                                    URI.create("http://localhost:" + orderPort + "/api/orders/" + recoveredOrderId))
                             .timeout(Duration.ofSeconds(5)).GET().build(), HttpResponse.BodyHandlers.ofString());
                     assertThat(fetched.statusCode()).isEqualTo(200);
                     assertThat(JSON.readTree(fetched.body()).path("status").asText()).isEqualTo("CONFIRMED");
                     assertThat(scalar(ORDER_DB,
-                            "select status from outbox_events where aggregate_id = ?", orderId)).isEqualTo("SENT");
+                            "select status from outbox_events where aggregate_id = ?", recoveredOrderId)).isEqualTo("SENT");
+                    assertThat(Integer.parseInt(scalar(ORDER_DB,
+                            "select attempt_count from outbox_events where aggregate_id = ?", recoveredOrderId)))
+                            .isGreaterThanOrEqualTo(2);
+                    assertThat(scalar(INVENTORY_DB,
+                            "select count(*) from inventory_inbox_events where event_id = ?", recoveredEventId))
+                            .isEqualTo("1");
+                    assertThat(scalar(INVENTORY_DB,
+                            "select source_event_id from inventory_reservation_decisions where order_id = ?",
+                            recoveredOrderId)).isEqualTo(recoveredEventId);
+                    assertThat(scalar(INVENTORY_DB,
+                            "select count(*) from inventory_reservation_decisions where order_id = ?",
+                            recoveredOrderId)).isEqualTo("1");
+                    assertThat(scalar(INVENTORY_DB,
+                            "select available_quantity from inventory where product_id = ?", product))
+                            .isEqualTo("4");
+                    assertThat(scalar(INVENTORY_DB,
+                            "select reserved_quantity from inventory where product_id = ?", product))
+                            .isEqualTo("1");
                 });
     }
 

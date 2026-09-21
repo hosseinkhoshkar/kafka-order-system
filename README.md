@@ -134,6 +134,9 @@ Readiness policy:
 
 Custom Micrometer metrics:
 
+HTTP server request timers also publish Prometheus `bucket`, `count` and `sum`
+series with bounded SLO buckets for the Grafana p95 latency panel.
+
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
 | `order_orders_created_total` | counter | none | Orders created after transaction commit. |

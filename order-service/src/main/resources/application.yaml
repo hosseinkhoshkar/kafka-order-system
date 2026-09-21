@@ -55,6 +55,11 @@ management:
       probes:
         enabled: true
       show-details: never
+      group:
+        liveness:
+          include: livenessState,ping
+        readiness:
+          include: readinessState,db
   endpoints:
     web:
       exposure:
@@ -64,11 +69,10 @@ management:
       enabled: false
     probes:
       enabled: true
-    group:
-      liveness:
-        include: livenessState,ping
-      readiness:
-        include: readinessState,db
+  metrics:
+    distribution:
+      slo:
+        http.server.requests: 50ms,100ms,250ms,500ms,1s,2s,5s
 
 observability:
   outbox:
