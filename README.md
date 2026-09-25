@@ -19,18 +19,22 @@ This is a portfolio and learning project. Its scope is order creation and stock 
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    Client[HTTP client] --> Order[Order service]
-    Order <--> OrderDB[(Order PostgreSQL)]
-    Order -->|Outbox: ORDER_CREATED| Orders[(orders)]
-    Orders --> Inventory[Inventory service]
-    Inventory <--> InventoryDB[(Inventory PostgreSQL)]
-    Inventory -->|Outbox: reservation result| Replies[(inventory-reply)]
-    Replies --> Order
-    Inventory -. failed consumption .-> OrdersDLT[(orders.DLT)]
-    Order -. failed consumption .-> RepliesDLT[(inventory-reply.DLT)]
+```text
+HTTP client
+    |
+    v
+Order service <--> Order PostgreSQL
+    |
+    | Order Outbox publishes to Kafka: orders
+    v
+Inventory service <--> Inventory PostgreSQL
+    |
+    | Inventory Outbox publishes to Kafka: inventory-reply
+    v
+Order service updates the order state
 ```
+
+Failed message consumption is routed to `orders.DLT` or `inventory-reply.DLT` after the configured recovery policy.
 
 Each service owns its database. Neither service writes to the other service's tables. Kafka messages use a shared JSON envelope and an order ID as the record key.
 
@@ -46,26 +50,14 @@ The Maven reactor uses Spring Boot 3.2.5, Spring Kafka 3.1.4, Spring Data JPA, F
 
 ### Order lifecycle
 
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant O as Order service
-    participant OD as Order DB
-    participant K as Kafka
-    participant I as Inventory service
-    participant ID as Inventory DB
-    C->>O: POST /api/orders
-    O->>OD: Commit order + history + Outbox (+ idempotency response)
-    O-->>C: 201 Created, PENDING, Location
-    O->>K: Publish ORDER_CREATED from Outbox
-    K->>I: Deliver order event
-    I->>ID: Commit Inbox + decision + stock update + history + reply Outbox
-    I->>K: Publish reservation result from Outbox
-    K->>O: Deliver inventory reply
-    O->>OD: Commit Inbox + valid state transition + history
-    C->>O: GET /api/orders/{orderId}
-    O-->>C: Current order state
-```
+1. The client submits `POST /api/orders`.
+2. Order service commits the `PENDING` order, event history and Outbox record in one transaction. When an idempotency key is supplied, the stored response is part of that transaction.
+3. The API returns `201 Created` with the initial order state and a `Location` header.
+4. The Order Outbox relay publishes `ORDER_CREATED` to Kafka.
+5. Inventory service commits its Inbox record, reservation decision, stock update, event history and reply Outbox record in one local transaction.
+6. The Inventory Outbox relay publishes the reservation result to Kafka.
+7. Order service commits the reply Inbox record, valid order-state transition and event history in one transaction.
+8. The client uses `GET /api/orders/{orderId}` to read the current state.
 
 Transactions are local to each database. Delivery is **at-least-once**, and consumers must tolerate redelivery. The event history is not an event-sourcing implementation.
 
